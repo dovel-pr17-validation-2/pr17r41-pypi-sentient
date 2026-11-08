@@ -1,0 +1,382 @@
+"""Developer commands for the backend the desktop app launches.
+
+The product is the desktop application. This CLI exists to run the backend on
+its own (``serve``), check an install (``doctor``) and inspect configuration.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import sys
+from pathlib import Path
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from sentient import __version__, paths
+from sentient.config import config_json_schema, load_config, save_config
+from sentient.config.schema import SentientConfig
+
+app = typer.Typer(help="Sentient backend (launched by the desktop app).", no_args_is_help=True)
+config_app = typer.Typer(help="Inspect and edit configuration.")
+app.add_typer(config_app, name="config")
+
+console = Console()
+
+
+def _setup_logging(verbose: bool) -> None:
+    paths.logs_dir().mkdir(parents=True, exist_ok=True)
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    for noisy in ("LiteLLM", "httpx", "httpcore", "aiosqlite", "multipart", "urllib3", "asyncio"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+@app.callback()
+def _root(verbose: bool = typer.Option(False, "--verbose", "-v", help="Debug logging.")):
+    _setup_logging(verbose)
+
+
+@app.command()
+def version():
+    """Print the version."""
+    console.print(f"sentient {__version__}")
+
+
+# Modules the engine imports lazily or only on first use (a model call, voice, a migration). An installer whose
+# frozen engine misses one of them still starts and answers `version`, then fails the first real request, which is
+# how v3.0.0-beta.1's first build shipped without numpy and tokenizers. packaging/build_engine.py runs this.
+_SELFCHECK_MODULES = (
+    "sentient.app",
+    "sentient.gateway.app",
+    "sentient.store.migrations",
+    "litellm",
+    "numpy",
+)
+
+
+@app.command("selfcheck", hidden=True)
+def selfcheck():
+    """Import everything the engine needs at runtime and fail loudly if anything is missing."""
+    import importlib
+
+    missing = []
+    for name in _SELFCHECK_MODULES:
+        try:
+            importlib.import_module(name)
+        except Exception as exc:  # any import-time failure counts, not only ModuleNotFoundError
+            missing.append(f"{name}: {type(exc).__name__}: {exc}")
+    if missing:
+        console.print("selfcheck failed:\n" + "\n".join(missing))
+        raise typer.Exit(1)
+    # the schema version is derived from the migration files, so this also proves they were bundled
+    from sentient.store.db import SCHEMA_VERSION
+
+    console.print(f"selfcheck ok ({len(_SELFCHECK_MODULES)} modules, database version {SCHEMA_VERSION})")
+
+
+@app.command()
+def serve(
+    host: str | None = typer.Option(None, help="Override gateway.host"),
+    port: int | None = typer.Option(None, help="Override gateway.port"),
+    reload: bool = typer.Option(False, help="Dev auto-reload"),
+):
+    """Run the backend (REST + WebSocket). The desktop app starts this for you."""
+    import uvicorn
+
+    from sentient.gateway.auth import ENV_TOKEN, load_or_create_token
+
+    cfg = load_config()
+    h = host or cfg.gateway.host
+    p = port if port is not None else cfg.gateway.port
+    if h not in {"127.0.0.1", "localhost", "::1"}:
+        console.print("[yellow]WARNING: binding a non-loopback address exposes your assistant to the network.[/yellow]")
+    token = load_or_create_token()
+    if not os.environ.get(ENV_TOKEN):
+        # started by hand: show how to open the UI in a browser
+        console.print(f"Sentient backend on http://{h}:{p}/  (dev UI: http://{h}:{p}/?api=http://{h}:{p}&token={token})")
+    if p:
+        # `sentient mcp` finds the engine through this file (issue #443): the desktop starts the
+        # engine on a fresh port each launch, so the configured port is not where it listens.
+        # The address only, no secret; the file is removed again when the engine stops (below),
+        # and the MCP server proves the engine is Sentient before it sends the token anywhere.
+        import contextlib
+        import json
+
+        from sentient import paths
+
+        with contextlib.suppress(Exception):
+            found = paths.discovery_file()
+            found.parent.mkdir(parents=True, exist_ok=True)
+            found.write_text(json.dumps({"host": h, "port": p}), encoding="utf-8")
+    uvicorn.run(
+        "sentient.gateway.app:create_app", factory=True, host=h, port=p, reload=reload,
+        log_level="warning", ws_ping_interval=20, ws_ping_timeout=60,
+    )
+    if p:
+        # the engine stopped: take the discovery file away again, so it cannot outlive the
+        # engine and point a future MCP server at a port something else has since taken over
+        import contextlib
+
+        from sentient import paths
+
+        with contextlib.suppress(Exception):
+            paths.discovery_file().unlink(missing_ok=True)
+
+
+@app.command()
+def node(
+    url: str = typer.Option(..., help="Engine address, e.g. wss://192.168.1.20:7778/ws/node"),
+    code: str | None = typer.Option(None, help="Pairing code shown in Sentient (first connection only)"),
+    name: str = typer.Option("Reference node", help="Name shown in Sentient"),
+    kind: str = typer.Option("glasses", help="phone, glasses, watch or custom"),
+    camera: int | None = typer.Option(None, help="Webcam index to offer as the device camera"),
+    fingerprint: str | None = typer.Option(
+        None, help="Certificate fingerprint shown in Sentient next to the pairing code (remembered after pairing)"
+    ),
+    insecure: bool = typer.Option(False, "--insecure", help="Accept any certificate (development only)"),
+    speech: bool = typer.Option(True, "--speech/--no-speech", help="Speak 'speak' requests aloud with pyttsx3"),
+    camera_off: bool = typer.Option(
+        False, "--camera-off", help="Start in camera-off mode: the camera is off on the device (type c to switch)"
+    ),
+):
+    """Run a reference device node that simulates a phone or smart glasses (owner: nodes agent).
+
+    --url also accepts the pairing link: "sentient://pair?url=...&code=...&fp=...".
+    """
+    from sentient.nodes.reference import main as node_main
+
+    node_main(
+        url=url, code=code, name=name, kind=kind, camera=camera, fingerprint=fingerprint, insecure=insecure,
+        speech=speech, camera_off=camera_off,
+    )
+
+
+@app.command()
+def mcp(
+    engine_url: str | None = typer.Option(
+        None, help="Engine address (default: the address the running engine left in its discovery file)"
+    ),
+):
+    """Let other AI apps on this computer use Sentient over MCP (off until turned on in Settings).
+
+    Started by the MCP client itself, for example with: claude mcp add sentient -- sentient mcp
+    """
+    from sentient.mcp_server.server import main
+
+    raise typer.Exit(main(engine_url=engine_url))
+
+
+@app.command("claude-code-tools", hidden=True)
+def claude_code_tools(tools_file: str):
+    """Sentient's tool list for Claude Code (started by Claude Code itself; see sentient/llm/claude_code_tools.py)."""
+    from sentient.llm.claude_code_tools import main
+
+    raise typer.Exit(main([tools_file]))
+
+
+@app.command()
+def backup(
+    to: Path | None = typer.Option(None, "--to", help="Folder for the backup (default: Documents/Sentient Backups; a data folder other than ~/.sentient uses its own backups folder)."),
+):
+    """Back up the data folder (database, config, workspace, skills, files) to one zip file."""
+    from sentient.backup import archive
+
+    folder = to or Path(load_config().backups.folder or archive.default_folder()).expanduser()
+    made = archive.create_archive(archive.new_backup_path(folder), kind="manual")
+    console.print(f"[green]backed up[/green] {made['path']} ({made['size']:,} bytes)")
+    console.print("API keys and sign-ins stay in this computer's keychain and are not in the backup.")
+
+
+@app.command()
+def restore(
+    archive_path: Path = typer.Argument(..., help="A backup or snapshot zip."),
+    now: bool = typer.Option(False, "--now", help="Replace the data at once. Only while Sentient is closed."),
+):
+    """Restore a backup. It replaces the data the next time Sentient starts (or at once with --now)."""
+    from sentient.backup import BackupError, apply_pending_restore, archive
+
+    try:
+        staged = archive.stage_restore(archive_path)
+    except BackupError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    console.print(f"backup from {staged.get('created_at')} checked: {', '.join(staged['contents'])}")
+    if not now:
+        console.print("It replaces your current data the next time Sentient starts.")
+        return
+    result = apply_pending_restore() or {}
+    if result.get("error"):
+        console.print(f"[red]{result['error']}[/red]")
+        raise typer.Exit(1)
+    kept = f"; your data from before is in snapshot {result['snapshot']}" if result.get("snapshot") else ""
+    console.print(f"[green]restored[/green]{kept}")
+    console.print("API keys and sign-ins are not in backups: sign in again to anything that asks.")
+
+
+@app.command()
+def doctor(
+    models: bool = typer.Option(
+        False, "--models", help="Also run the model check-up: a reply, a tool call, JSON, context and GPU per role."
+    ),
+):
+    """Check that everything needed to run is in place."""
+    asyncio.run(_doctor(models))
+
+
+async def _doctor(models: bool = False) -> None:
+    from sentient.app import SentientApp
+
+    table = Table(title="sentient doctor")
+    table.add_column("check")
+    table.add_column("status")
+    table.add_column("detail", overflow="fold")
+
+    def row(name: str, ok: bool | None, detail: str = ""):
+        mark = "[green]ok[/green]" if ok else ("[yellow]warn[/yellow]" if ok is None else "[red]fail[/red]")
+        table.add_row(name, mark, detail)
+
+    row("home", paths.home().exists(), str(paths.home()))
+    try:
+        cfg = load_config()
+        row("config", True, str(paths.config_file()) if paths.config_file().exists() else "defaults (finish onboarding in the app)")
+    except Exception as exc:
+        row("config", False, str(exc))
+        console.print(table)
+        return
+    s = SentientApp(cfg, enable_background=False)
+    checkup_table: Table | None = None
+    try:
+        await s.start()
+        row("database", True, str(s.store.path))
+        row("sqlite-vec", s.store.vec_available, "semantic memory " + ("enabled" if s.store.vec_available else "DISABLED"))
+        row("tools", True, f"{len(s.registry.tools())} tools from {len(s.registry.plugins())} plugins")
+        row("skills", True, f"{len(s.skills.list())} active, {len(s.skills.list_pending())} pending review")
+        try:
+            lan = s.nodes.lan_status()
+            if lan["enabled"]:
+                if not lan["running"] or lan["error"]:
+                    row(
+                        "lan listener",
+                        False,
+                        f"port {lan['port']}, not running"
+                        + (f": {lan['error']}" if lan["error"] else ""),
+                    )
+                elif lan["bind_all"]:
+                    row(
+                        "lan listener",
+                        None,
+                        f"port {lan['port']}, bound to all interfaces (nodes.lan_bind_all); any host on the network can reach it, pairing required",
+                    )
+                else:
+                    row(
+                        "lan listener",
+                        True,
+                        f"port {lan['port']}, this computer only (loopback)",
+                    )
+        except Exception as exc:
+            row("lan listener", False, str(exc))
+        try:
+            text = ""
+            async for chunk in s.llm.stream("primary", [{"role": "user", "content": "Reply with the single word: ready"}]):
+                text += chunk.text
+            row("primary model", True, f"{s.llm.model_for('primary')} -> {text.strip()[:40]!r}")
+        except Exception as exc:
+            row("primary model", False, f"{s.llm.model_for('primary')}: {exc}")
+        sizes: dict[int, list[str]] = {}
+        for role in ("primary", "fast", "planner", "executor", "vision", "voice"):
+            n = await s.llm.context_length(role)
+            if n:
+                sizes.setdefault(n, []).append(role)
+        if sizes:
+            row("context length", True, "; ".join(f"{n} tokens: {', '.join(roles)}" for n, roles in sizes.items()))
+        try:
+            [vec] = await s.llm.embed(["hello"])
+            row("embedding model", True, f"{s.llm.model_for('embedding')} (dim {len(vec)})")
+        except Exception as exc:
+            row("embedding model", False, f"{s.llm.model_for('embedding')}: {exc}")
+        if models:
+            checkup_table = await _model_checkup(s)
+    except Exception as exc:
+        row("startup", False, str(exc))
+    finally:
+        await s.stop()
+    console.print(table)
+    if checkup_table is not None:
+        console.print(checkup_table)
+
+
+async def _model_checkup(s) -> Table:
+    from sentient.llm.checkup import run_checkup
+
+    marks = {"pass": "[green]ok[/green]", "warn": "[yellow]warn[/yellow]", "fail": "[red]fail[/red]", "skip": "skip"}
+    table = Table(title="model check-up")
+    table.add_column("role")
+    table.add_column("check")
+    table.add_column("status")
+    table.add_column("detail", overflow="fold")
+    with console.status("Checking models...") as status:
+        probe = getattr(s, "hardware", None)
+        hardware = await probe.get() if probe is not None else None
+        if hardware is not None:
+            rec = hardware["recommendation"]
+            suggestion = rec["note"] if rec.get("cloud_first") else f"Suggested local model: {rec['summary']}."
+            console.print(f"This computer: {hardware['summary']}. {suggestion}")
+        async for event in run_checkup(s.config, s.llm, hardware=hardware):
+            if event["type"] == "step":
+                status.update(f"{event['role']}: {event['label']}...")
+            elif event["type"] == "role":
+                name = f"{event['role']}\n[dim]{event['model'] or 'uses primary'}[/dim]"
+                if not event["checks"]:
+                    table.add_row(name, "", marks["skip"], "Uses the primary model.")
+                for i, c in enumerate(event["checks"]):
+                    detail = c["detail"] + (f"\n[bold]Fix:[/bold] {c['fix']}" if c.get("fix") else "")
+                    table.add_row(name if i == 0 else "", c["label"], marks[c["status"]], detail)
+                table.add_section()
+    return table
+
+
+@config_app.command("path")
+def config_path():
+    console.print(str(paths.config_file()))
+
+
+@config_app.command("show")
+def config_show(defaults: bool = typer.Option(False, help="Show defaults instead of the saved file.")):
+    cfg = SentientConfig() if defaults else load_config()
+    console.print_json(cfg.model_dump_json(indent=2))
+
+
+@config_app.command("schema")
+def config_schema(out: Path | None = typer.Option(None, help="Write JSON schema to a file.")):
+    schema = config_json_schema()
+    if out:
+        out.write_text(json.dumps(schema, indent=2), encoding="utf-8")
+        console.print(f"wrote {out}")
+    else:
+        console.print_json(json.dumps(schema))
+
+
+@config_app.command("set")
+def config_set(key: str = typer.Argument(..., help="Dotted key, e.g. models.roles.primary"), value: str = typer.Argument(...)):
+    cfg = load_config()
+    data = cfg.model_dump(mode="json")
+    node = data
+    parts = key.split(".")
+    for part in parts[:-1]:
+        node = node.setdefault(part, {})
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        parsed = value
+    node[parts[-1]] = parsed
+    save_config(SentientConfig.model_validate(data))
+    console.print(f"[green]set[/green] {key} = {parsed!r}")
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(app())

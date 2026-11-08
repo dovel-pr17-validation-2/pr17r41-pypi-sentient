@@ -1,0 +1,190 @@
+"""Typed events streamed from the agent loop to every client.
+
+These replace the legacy approach of diffing a serialized transcript and
+asking the UI to regex ``<think>``/``<tool_code>`` tags out of a text stream.
+Every client (web UI, CLI, glasses node, a Telegram adapter) consumes the
+same event stream; the gateway serializes them as JSON with a ``type`` field.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+
+class _Event(BaseModel):
+    session_id: str | None = None
+    turn_id: str | None = None
+
+
+class TextDelta(_Event):
+    type: Literal["text_delta"] = "text_delta"
+    text: str
+
+
+class ThinkingDelta(_Event):
+    type: Literal["thinking_delta"] = "thinking_delta"
+    text: str
+
+
+class ToolCallEvent(_Event):
+    type: Literal["tool_call"] = "tool_call"
+    call_id: str
+    name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolProgress(_Event):
+    """Output of a tool that is still running (code stdout, browser frames, subagent steps)."""
+
+    type: Literal["tool_progress"] = "tool_progress"
+    call_id: str
+    name: str
+    kind: Literal["stdout", "stderr", "status", "frame", "subagent"] = "status"
+    text: str | None = None
+    image: str | None = None
+    data: Any = None
+
+
+class ToolResultEvent(_Event):
+    type: Literal["tool_result"] = "tool_result"
+    call_id: str
+    name: str
+    result: Any = None
+    is_error: bool = False
+    duration_ms: int | None = None
+    # what code found the call really did (#165, ``sentient.agent.outcomes``): {tool, app, kind, action, ok, detail,
+    # how, targets, missed}; None for calls that aren't checked
+    check: dict[str, Any] | None = None
+
+
+class ApprovalRequest(_Event):
+    type: Literal["approval_request"] = "approval_request"
+    approval_id: str
+    call_id: str
+    name: str
+    arguments: dict[str, Any]
+    risk: str
+    reason: str = ""
+    risk_label: str | None = None  # "Purchase", "Sends", "Runs code"... (Tool.describe_fn or the effective risk)
+    target: str | None = None      # short human label of what is acted on, e.g. "Place order"
+    # why this asks although rules or modes would let it run: the chat read outside content (ADR 0018)
+    untrusted: str | None = None
+    # what a second look found off about this call (#143): "You asked to email Arjun, but this goes to x@..."
+    warning: str | None = None
+    # the answers offered, in button order (#139): allow, allow_session, allow_timed, allow_always, deny. Only
+    # "allow" and "deny" for a purchase, a raised risk, running code or a call after outside content
+    choices: list[str] | None = None
+    grant_minutes: int | None = None  # how long allow_timed lasts ("Allow for 1 hour")
+    # what will be sent or changed, the way a person reads it (#142): {kind, title, fields: [{label, value}], body}
+    preview: dict[str, Any] | None = None
+
+
+class UndoWindow(_Event):
+    """An email, message or post waiting ``seconds`` before it goes, so the user can still undo it (#142). It runs
+    only when the window ends; its ``tool_result`` follows then (``{"undone": true}`` when the user pressed Undo)."""
+
+    type: Literal["undo_window"] = "undo_window"
+    undo_id: str
+    call_id: str
+    name: str
+    seconds: int
+    until: str  # ISO time the window ends
+    preview: dict[str, Any] | None = None
+
+
+class UserInterjection(_Event):
+    """A steer message the model received in the middle of a running reply."""
+
+    type: Literal["user_interjection"] = "user_interjection"
+    text: str
+
+
+class Usage(_Event):
+    type: Literal["usage"] = "usage"
+    model: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    # context meter (#131), set when the model's context length is known: tokens in its context after this call,
+    # what it reads at once, the share in percent, and a plain warning from 85%
+    context_used: int | None = None
+    context_length: int | None = None
+    context_percent: int | None = None
+    context_warning: str | None = None
+
+
+class Error(_Event):
+    type: Literal["error"] = "error"
+    message: str
+    recoverable: bool = True
+    # what stopped the reply when the chat can offer a fix (#148): "local_only" (Local only is on and the model is
+    # in the cloud) or "budget_reached" (this month's model budget is used up)
+    code: str | None = None
+
+
+class Notice(_Event):
+    """A plain note about this reply that is not an error, shown once above it. ``code`` says what it is about:
+    ``model_fallback`` when the chat's own model couldn't answer and the default model answered instead (#312)."""
+
+    type: Literal["notice"] = "notice"
+    message: str
+    code: str = ""
+    model: str | None = None  # the chat's model that couldn't answer
+    used: str | None = None  # the model that answered instead
+
+
+class Done(_Event):
+    type: Literal["done"] = "done"
+    content: str = ""
+    message_id: str | None = None
+    cancelled: bool = False
+    # set when the turn ended in an error before any reply (the ``error`` event before it has the message to show);
+    # nothing was saved then and ``message_id`` is null
+    error: str | None = None
+    # memories this reply had in mind (sentient.memory.sources): what was in its prompt or returned by memory tools
+    memory_sources: list[dict[str, Any]] = Field(default_factory=list)
+    # pages, emails, files and apps this reply used (sentient.agent.sources, #174)
+    sources: list[dict[str, Any]] = Field(default_factory=list)
+    # the outcome checks of this reply's calls (#165), each failure that still stands with its plain ``message``
+    checks: list[dict[str, Any]] = Field(default_factory=list)
+
+
+AgentEvent = (
+    TextDelta
+    | ThinkingDelta
+    | ToolCallEvent
+    | ToolProgress
+    | ToolResultEvent
+    | ApprovalRequest
+    | UndoWindow
+    | UserInterjection
+    | Usage
+    | Error
+    | Notice
+    | Done
+)
+
+PROGRESS_KINDS = ("stdout", "stderr", "status", "frame", "subagent")
+
+
+def tool_progress_event(call_id: str, name: str, payload: dict, **ev: Any) -> ToolProgress:
+    """Build a ToolProgress from a free-form ``ctx.progress`` payload. Unknown keys go into ``data``."""
+    payload = dict(payload or {})
+    kind = payload.pop("kind", "status")
+    if kind not in PROGRESS_KINDS:
+        kind = "status"
+    text = payload.pop("text", None)
+    image = payload.pop("image", None)
+    data = payload.pop("data", None)
+    if payload:  # extra keys are kept rather than dropped
+        data = {**(data if isinstance(data, dict) else ({"value": data} if data is not None else {})), **payload}
+    return ToolProgress(
+        call_id=call_id,
+        name=name,
+        kind=kind,
+        text=None if text is None else str(text),
+        image=None if image is None else str(image),
+        data=data,
+        **ev,
+    )

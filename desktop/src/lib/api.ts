@@ -1,0 +1,994 @@
+/**
+ * Typed REST client for every endpoint in docs/API.md.
+ *
+ *   import { api } from '@/lib/api'
+ *   const sessions = await api.sessions.list()
+ *
+ * - The connection (base URL + token) is set once by the connection store.
+ * - Non-2xx responses throw `ApiError` with the backend's `detail`.
+ * - NDJSON endpoints use `streamNdjson` (async iterator) and accept an AbortSignal.
+ * - Uploads use XHR so callers get progress events.
+ * - In dev demo mode (`?demo=1`, never in a packaged build) a few endpoints answer from lib/demo.ts when the
+ *   engine does not have them yet; whenever the engine answers, its data is used.
+ */
+import type {
+  ForgetCounts,
+  Forgotten,
+  AwayStatus,
+  EmailTasksStatus,
+  BackupEntry,
+  BackupInspect,
+  BackupOverview,
+  FoldersOverview,
+  WatchedFolder,
+  TimelineFilters,
+  TimelinePage,
+  TimelineUpcoming,
+  RestoreStaged,
+  BrowserProfileCreate,
+  BrowserProfilePatch,
+  BrowserProfiles,
+  BrowserStatus,
+  Channel,
+  ChannelPairing,
+  ClaudeCodeStatus,
+  DeviceInvokeResult,
+  DeviceLanInfo,
+  DeviceNode,
+  DevicePairing,
+  Dream,
+  FeedStatus,
+  HermesPart,
+  MemoryExport,
+  MemoryImportApp,
+  MemoryImportJob,
+  MemoryImportPreview,
+  HermesPreview,
+  HermesResult,
+  Hook,
+  HookCreated,
+  Insight,
+  InsightDimension,
+  InsightStatus,
+  SandboxResult,
+  SandboxStatus,
+  Subagent,
+  TerminalStatus,
+  ApprovalDecision,
+  ApprovalGrant,
+  Bootstrap,
+  SensorState,
+  SensorStopResult,
+  StopResult,
+  StopState,
+  ChatRequest,
+  AgentEvent,
+  DomainEvent,
+  CheckupEvent,
+  ClarificationAnswer,
+  ConfigPatchResponse,
+  ConnectionAccess,
+  ConnectResponse,
+  DeepPartial,
+  DictateResult,
+  EmbeddingTestResult,
+  EvolutionLogEntry,
+  FallbacksResponse,
+  FileEntry,
+  Hardware,
+  Health,
+  Integration,
+  IntegrationTestResult,
+  JsonSchema,
+  LocalModels,
+  McpServer,
+  McpServerCreate,
+  McpSignInStart,
+  McpTestResult,
+  Memory,
+  MemoryGraph,
+  MemoryImportResult,
+  MemoryQuery,
+  MemoryReviewInbox,
+  MemoryScope,
+  MemorySummary,
+  MemoryTopic,
+  MemoryWriteResult,
+  MessageSearchHit,
+  ModelPreset,
+  ModelPresetList,
+  ModelRoles,
+  ModelTestResult,
+  ModelBusy,
+  CatalogModel,
+  ChatGPTStatus,
+  ProviderKeyCheck,
+  ProviderSignIn,
+  ProviderSignInStatus,
+  NotificationList,
+  OkResponse,
+  PresetApplyResult,
+  OllamaPullProgress,
+  OnboardingRequest,
+  OpenAIApiKey,
+  Persona,
+  PrivacyFilters,
+  IntegrationEntities,
+  EntityChoice,
+  ProactivityPreference,
+  Brief,
+  BriefFeedback,
+  BriefKind,
+  BriefSectionId,
+  BriefSetup,
+  BriefState,
+  ProactivityStatus,
+  ProgressUpdate,
+  Provider,
+  RoleName,
+  Reminder,
+  ReminderStatus,
+  SnoozedAlarm,
+  RuleProposal,
+  SecretStatus,
+  SentientConfig,
+  Session,
+  Skill,
+  SkillCreate,
+  SkillDetail,
+  SkillDiff,
+  SkillReviewResult,
+  SkillsList,
+  HubInstall,
+  HubInstalled,
+  HubListing,
+  HubPreview,
+  HubSource,
+  HubUpdateResult,
+  SkillUpdate,
+  SuggestionActionResponse,
+  Task,
+  TaskCreateRequest,
+  TaskPatch,
+  TaskPreview,
+  TaskScript,
+  ToolPlugin,
+  TranscribeResult,
+  TranscriptMessage,
+  UndoAction,
+  UploadedFile,
+  UsageReport,
+  BudgetState,
+  CostReport,
+  UserModel,
+  UserModelRefreshResult,
+  VoicePrepareProgress,
+  VoicePrepareTarget,
+  VoiceStatus,
+  WorkspaceFileId,
+  WorkspaceSnapshot
+} from './types'
+import type { Connection } from '@/types/bridge'
+import { DEMO_FEEDS, demo, isDemoChatGPT, isDemoMode } from './demo'
+
+// ---------------------------------------------------------------------------- connection
+let connection: Connection | null = null
+const waiters: Array<(c: Connection) => void> = []
+
+export function setConnection(conn: Connection): void {
+  connection = { baseUrl: conn.baseUrl.replace(/\/+$/, ''), token: conn.token }
+  waiters.splice(0).forEach((w) => w(connection as Connection))
+}
+
+export function getConnection(): Connection | null {
+  return connection
+}
+
+/** Resolves once the connection store has a connection. */
+export function whenConnected(): Promise<Connection> {
+  return connection ? Promise.resolve(connection) : new Promise((r) => waiters.push(r))
+}
+
+// ---------------------------------------------------------------------------- errors
+export class ApiError extends Error {
+  readonly status: number
+  readonly detail: string
+  readonly body: unknown
+  readonly path: string
+
+  constructor(status: number, detail: string, body: unknown, path: string) {
+    super(detail)
+    this.name = 'ApiError'
+    this.status = status
+    this.detail = detail
+    this.body = body
+    this.path = path
+  }
+
+  get isNotFound() {
+    return this.status === 404 || this.status === 405
+  }
+  get isNetwork() {
+    return this.status === 0
+  }
+}
+
+export function isApiError(e: unknown): e is ApiError {
+  return e instanceof ApiError
+}
+
+/** True when an endpoint isn't implemented yet (404/405/501) - render an empty/"coming soon" state. */
+export function isNotImplemented(e: unknown): boolean {
+  return isApiError(e) && [404, 405, 501].includes(e.status)
+}
+
+/** React Query `retry`: give up at once when the endpoint is missing, otherwise retry twice. */
+export function noRetryWhenMissing(count: number, err: unknown): boolean {
+  return !isNotImplemented(err) && count < 2
+}
+
+/** The extra yes a Skills hub install asks for (#210): a source the user added, or high-risk findings. */
+export function hubConfirmCode(e: unknown): 'confirm_source' | 'high_risk' | null {
+  if (!isApiError(e) || e.status !== 409 || !e.body || typeof e.body !== 'object') return null
+  const code = (e.body as { code?: unknown }).code
+  return code === 'confirm_source' || code === 'high_risk' ? code : null
+}
+
+export function errorMessage(e: unknown): string {
+  if (isApiError(e)) return e.detail
+  if (e instanceof Error) return e.message
+  return String(e)
+}
+
+function detailFrom(body: unknown, fallback: string): string {
+  if (body && typeof body === 'object' && 'detail' in body) {
+    const d = (body as { detail: unknown }).detail
+    if (typeof d === 'string') return d
+    if (Array.isArray(d)) {
+      return d
+        .map((x: { loc?: unknown[]; msg?: string }) =>
+          [Array.isArray(x.loc) ? x.loc.filter((p) => p !== 'body').join('.') : '', x.msg].filter(Boolean).join(': ')
+        )
+        .join('; ')
+    }
+  }
+  return fallback
+}
+
+// ---------------------------------------------------------------------------- core request helpers
+type Query = Record<string, string | number | boolean | null | undefined>
+
+export interface RequestOptions {
+  query?: Query
+  body?: unknown
+  signal?: AbortSignal
+  headers?: Record<string, string>
+}
+
+export function buildUrl(path: string, query?: Query): string {
+  const conn = connection
+  if (!conn) throw new ApiError(0, 'Not connected to the Sentient engine yet.', null, path)
+  const url = new URL(conn.baseUrl + path)
+  if (query) {
+    for (const [k, v] of Object.entries(query)) {
+      if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v))
+    }
+  }
+  return url.toString()
+}
+
+async function send(method: string, path: string, opts: RequestOptions = {}): Promise<Response> {
+  const conn = connection ?? (await whenConnected())
+  const isForm = typeof FormData !== 'undefined' && opts.body instanceof FormData
+  let res: Response
+  try {
+    res = await fetch(buildUrl(path, opts.query), {
+      method,
+      signal: opts.signal,
+      headers: {
+        Authorization: `Bearer ${conn.token}`,
+        ...(opts.body !== undefined && !isForm ? { 'Content-Type': 'application/json' } : {}),
+        ...opts.headers
+      },
+      body: opts.body === undefined ? undefined : isForm ? (opts.body as FormData) : JSON.stringify(opts.body)
+    })
+  } catch (err) {
+    if ((err as Error)?.name === 'AbortError') throw err
+    throw new ApiError(0, "Can't reach the Sentient engine.", null, path)
+  }
+  if (!res.ok) {
+    let body: unknown = null
+    const text = await res.text().catch(() => '')
+    try {
+      body = text ? JSON.parse(text) : null
+    } catch {
+      body = text
+    }
+    throw new ApiError(res.status, detailFrom(body, text || `${res.status} ${res.statusText}`), body, path)
+  }
+  return res
+}
+
+export async function request<T>(method: string, path: string, opts?: RequestOptions): Promise<T> {
+  const res = await send(method, path, opts)
+  if (res.status === 204) return undefined as T
+  const type = res.headers.get('content-type') ?? ''
+  if (type.includes('application/json')) return (await res.json()) as T
+  return (await res.text()) as unknown as T
+}
+
+function timelineQuery(f: TimelineFilters): Record<string, string | undefined> {
+  return { kinds: f.kinds?.length ? f.kinds.join(',') : undefined, app: f.app || undefined, q: f.q?.trim() || undefined }
+}
+
+export const http = {
+  get: <T>(path: string, opts?: RequestOptions) => request<T>('GET', path, opts),
+  post: <T>(path: string, body?: unknown, opts?: RequestOptions) => request<T>('POST', path, { ...opts, body }),
+  put: <T>(path: string, body?: unknown, opts?: RequestOptions) => request<T>('PUT', path, { ...opts, body }),
+  patch: <T>(path: string, body?: unknown, opts?: RequestOptions) => request<T>('PATCH', path, { ...opts, body }),
+  delete: <T>(path: string, opts?: RequestOptions) => request<T>('DELETE', path, opts),
+  blob: async (method: string, path: string, opts?: RequestOptions) => (await send(method, path, opts)).blob()
+}
+
+/**
+ * Stream an NDJSON endpoint line by line.
+ *
+ *   for await (const line of streamNdjson<OllamaPullProgress>('POST', '/api/models/ollama/pull', { body: { name } })) ...
+ */
+export async function* streamNdjson<T>(method: string, path: string, opts: RequestOptions = {}): AsyncGenerator<T> {
+  const res = await send(method, path, opts)
+  if (!res.body) return
+  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader()
+  let buffer = ''
+  try {
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buffer += value
+      let nl: number
+      while ((nl = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, nl).trim()
+        buffer = buffer.slice(nl + 1)
+        if (line) {
+          try {
+            yield JSON.parse(line) as T
+          } catch {
+            /* skip malformed line */
+          }
+        }
+      }
+    }
+    const tail = buffer.trim()
+    if (tail) {
+      try {
+        yield JSON.parse(tail) as T
+      } catch {
+        /* ignore */
+      }
+    }
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+export interface UploadOptions {
+  field?: string
+  signal?: AbortSignal
+  onProgress?: (fraction: number, loaded: number, total: number) => void
+  extra?: Record<string, string>
+}
+
+/** Multipart upload with progress (XHR). */
+export function upload<T>(path: string, file: Blob, filename: string, opts: UploadOptions = {}): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const conn = connection
+    if (!conn) {
+      reject(new ApiError(0, 'Not connected to the Sentient engine yet.', null, path))
+      return
+    }
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', buildUrl(path))
+    xhr.setRequestHeader('Authorization', `Bearer ${conn.token}`)
+    xhr.responseType = 'text'
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) opts.onProgress?.(e.loaded / e.total, e.loaded, e.total)
+    }
+    xhr.onload = () => {
+      let body: unknown = null
+      try {
+        body = xhr.responseText ? JSON.parse(xhr.responseText) : null
+      } catch {
+        body = xhr.responseText
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        opts.onProgress?.(1, file.size, file.size)
+        resolve(body as T)
+      } else {
+        reject(new ApiError(xhr.status, detailFrom(body, `Upload failed (${xhr.status})`), body, path))
+      }
+    }
+    xhr.onerror = () => reject(new ApiError(0, 'Upload failed: engine unreachable.', null, path))
+    xhr.onabort = () => reject(new DOMException('Upload cancelled', 'AbortError'))
+    opts.signal?.addEventListener('abort', () => xhr.abort())
+    const form = new FormData()
+    form.append(opts.field ?? 'file', file, filename)
+    for (const [k, v] of Object.entries(opts.extra ?? {})) form.append(k, v)
+    xhr.send(form)
+  })
+}
+
+/** URL usable in <img src> / <audio src>; the token travels as a query parameter. */
+export function authedUrl(path: string, query?: Query): string {
+  const conn = connection
+  if (!conn) return ''
+  return buildUrl(path, { ...query, token: conn.token })
+}
+
+const enc = encodeURIComponent
+const encPath = (name: string) => name.split('/').map(enc).join('/')
+
+/** Webhook URLs may come back relative (`/hooks/abc`); make them absolute against the engine. */
+export function absoluteHookUrl(url: string): string {
+  if (/^https?:\/\//i.test(url)) return url
+  const base = getConnection()?.baseUrl ?? 'http://127.0.0.1:7777'
+  return `${base}${url.startsWith('/') ? '' : '/'}${url}`
+}
+
+/**
+ * Real engine first, always. Only in dev demo mode, and only when the endpoint is missing (404/405/501) or the
+ * engine is unreachable, answer from the demo fixtures in lib/demo.ts. Real engine data is never replaced.
+ */
+async function withDemoFallback<T>(real: () => Promise<T>, fake: () => T | Promise<T>): Promise<T> {
+  if (!isDemoMode()) return real()
+  try {
+    return await real()
+  } catch (err) {
+    if (isNotImplemented(err) || (isApiError(err) && err.status === 0)) return fake()
+    throw err
+  }
+}
+
+// ---------------------------------------------------------------------------- endpoints
+export const api = {
+  // §2 core ------------------------------------------------------------------
+  health: () => http.get<Health>('/api/health'),
+  bootstrap: () => http.get<Bootstrap>('/api/bootstrap'),
+  onboarding: (body: OnboardingRequest) => http.post<OkResponse>('/api/onboarding', body),
+  /** The window is in use: resets the timer that pauses routines while you are away (#163). */
+  activity: () => http.post<{ ok: boolean; last_active_at: string | null }>('/api/activity'),
+
+  // §24 live microphones and cameras (#170)
+  sensors: {
+    get: () => http.get<SensorState>('/api/sensors'),
+    stop: (id?: string) => http.post<SensorStopResult>('/api/sensors/stop', id ? { id } : {})
+  },
+
+  // §17 stop everything
+  stop: {
+    get: () => http.get<StopState>('/api/stop'),
+    all: (source = 'desktop') => http.post<StopResult>('/api/stop-all', { source }),
+    resume: (source = 'desktop') => http.post<StopState>('/api/resume', { source })
+  },
+
+  config: {
+    get: () => http.get<SentientConfig>('/api/config'),
+    schema: () => http.get<JsonSchema>('/api/config/schema'),
+    put: (config: SentientConfig) => http.put<{ saved: boolean }>('/api/config', config),
+    patch: (patch: DeepPartial<SentientConfig> | Record<string, unknown>) =>
+      http.patch<ConfigPatchResponse>('/api/config', patch)
+  },
+
+  // §2 the OpenAI-compatible API (#211): a new key, shown once, replaces the old one
+  openaiApi: {
+    makeKey: () => http.post<OpenAIApiKey>('/api/openai-api/key')
+  },
+
+  sessions: {
+    list: (limit = 100) => http.get<Session[]>('/api/sessions', { query: { limit } }),
+    create: (opts: { incognito?: boolean; model?: string | null; memory_scope?: string | null } = {}) =>
+      http.post<{ session_id: string }>('/api/sessions', undefined, {
+        query:
+          opts.incognito || opts.model || opts.memory_scope
+            ? {
+                ...(opts.incognito ? { incognito: true } : {}),
+                ...(opts.model ? { model: opts.model } : {}),
+                ...(opts.memory_scope ? { memory_scope: opts.memory_scope } : {})
+              }
+            : undefined
+      }),
+    rename: (id: string, title: string) => http.patch<OkResponse>(`/api/sessions/${enc(id)}`, { title }),
+    /** The chat's own model (#312); null follows the default again. */
+    setModel: (id: string, model: string | null) =>
+      http.patch<OkResponse & { model: string | null }>(`/api/sessions/${enc(id)}`, { model }),
+    /** The memories this chat uses (#155); null goes back to the default (Personal, or its messaging app's). */
+    setScope: (id: string, memory_scope: string | null) =>
+      http.patch<OkResponse & { memory_scope: string }>(`/api/sessions/${enc(id)}`, { memory_scope }),
+    delete: (id: string) => http.delete<OkResponse>(`/api/sessions/${enc(id)}`),
+    /**
+     * "I've checked it, trust this chat again" (ADR 0029), up to `upto`, the newest message the window has shown.
+     * `trusted: false` with `untrusted`/`writer` when outside content newer than that keeps the chat marked.
+     */
+    trust: (id: string, upto?: string | null) =>
+      http.post<OkResponse & { was: string; trusted: boolean; untrusted: string; writer: string }>(
+        `/api/sessions/${enc(id)}/trust`,
+        { upto: upto ?? null }
+      ),
+    messages: (id: string, limit = 500) =>
+      http.get<TranscriptMessage[]>(`/api/sessions/${enc(id)}/messages`, { query: { limit } }),
+    search: (q: string) => http.get<MessageSearchHit[]>('/api/sessions/search', { query: { q } })
+  },
+
+  /** "Make this a rule?" cards from what was said in a chat (#130). Only `decide` creates a rule. */
+  ruleProposals: {
+    list: (sessionId: string) => http.get<RuleProposal[]>(`/api/sessions/${enc(sessionId)}/rule-proposals`),
+    decide: (id: string, decision: 'accept' | 'decline') =>
+      http.post<RuleProposal>(`/api/rule-proposals/${enc(id)}`, { decision })
+  },
+
+  chat: {
+    /** NDJSON fallback of a WebSocket turn. First line is `{type:"session", session_id}`; "Make this a rule?" cards
+     *  for the chat come as `rule_proposal.updated` lines in the /ws envelope (#311). */
+    stream: (body: ChatRequest, signal?: AbortSignal) =>
+      streamNdjson<AgentEvent | DomainEvent<'rule_proposal.updated'>>('POST', '/api/chat', { body, signal })
+  },
+
+  approvals: {
+    respond: (approval_id: string, decision: ApprovalDecision) =>
+      http.post<{ resolved: boolean }>('/api/approvals', { approval_id, decision }),
+    /** Live "Allow for this task" and "Allow for 1 hour" answers (#139). */
+    grants: () => http.get<{ grants: ApprovalGrant[] }>('/api/approvals/grants'),
+    revokeGrant: (id: string) => http.delete<OkResponse>(`/api/approvals/grants/${enc(id)}`)
+  },
+
+  /** §10 Undo, or send now, an email, message or post waiting in its undo window (#142). */
+  undo: {
+    respond: (undo_id: string, action: UndoAction) => http.post<{ done: boolean; action: UndoAction }>('/api/undo', { undo_id, action })
+  },
+
+  files: {
+    upload: (file: File | Blob, filename: string, opts?: UploadOptions) =>
+      upload<UploadedFile>('/api/files', file, filename, opts),
+    list: () => http.get<FileEntry[]>('/api/files'),
+    contentUrl: (name: string) => authedUrl(`/api/files/content/${encPath(name)}`),
+    download: (name: string) => http.blob('GET', `/api/files/content/${encPath(name)}`),
+    /** False when the file is gone (deleted, or went with an incognito chat), so a chat never shows another file (#458). */
+    exists: async (name: string) => {
+      try {
+        await send('HEAD', `/api/files/content/${encPath(name)}`)
+        return true
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 404) return false
+        throw err
+      }
+    },
+    delete: (name: string) => http.delete<OkResponse>(`/api/files/${encPath(name)}`)
+  },
+
+  tools: {
+    list: () => http.get<ToolPlugin[]>('/api/tools')
+  },
+
+  usage: {
+    get: (days = 30) => http.get<UsageReport>('/api/usage', { query: { days } }),
+    cost: () => http.get<CostReport>('/api/usage/cost'),
+    keepGoing: () => http.post<BudgetState>('/api/usage/budget/keep-going')
+  },
+
+  // §3 models & secrets ------------------------------------------------------
+  models: {
+    providers: () => http.get<Provider[]>('/api/models/providers'),
+    local: () => http.get<LocalModels>('/api/models/local'),
+    /** This computer's memory and graphics card, and the local model that fits it (cached by the engine). */
+    hardware: (refresh = false) => http.get<Hardware>('/api/system/hardware', { query: refresh ? { refresh: true } : undefined }),
+    test: (model: string, role?: RoleName) => http.post<ModelTestResult>('/api/models/test', { model, role }),
+    testEmbedding: (model: string) => http.post<EmbeddingTestResult>('/api/models/test-embedding', { model }),
+    claudeCode: () => http.get<ClaudeCodeStatus>('/api/models/claude-code'),
+    /** What the local model is doing now and what waits for it (#149). */
+    busy: () => http.get<ModelBusy>('/api/models/busy'),
+    setRoles: (roles: Partial<Record<RoleName, string | null>>) => http.put<ModelRoles>('/api/models/roles', roles),
+    setFallbacks: (fallbacks: Partial<Record<RoleName, string[]>>) =>
+      http.put<FallbacksResponse>('/api/models/fallbacks', fallbacks),
+    pullOllama: (name: string, signal?: AbortSignal) =>
+      streamNdjson<OllamaPullProgress>('POST', '/api/models/ollama/pull', { body: { name }, signal }),
+    /** Check each role's model (or only `roles`); never changes config. */
+    checkup: (roles?: Partial<Record<RoleName, string | null>>, signal?: AbortSignal) =>
+      streamNdjson<CheckupEvent>('POST', '/api/models/checkup', { body: roles ? { roles } : {}, signal }),
+    /** Start OpenRouter's browser sign-in; open `auth_url`, then poll `signInStatus(state)`. */
+    connectOpenRouter: () => http.post<ProviderSignIn>('/api/models/connect/openrouter'),
+    signInStatus: (state: string, provider: 'openrouter' | 'chatgpt' = 'openrouter') =>
+      http.get<ProviderSignInStatus>(`/api/models/connect/${provider}/${enc(state)}`),
+    /** Sign in with ChatGPT to use a ChatGPT plan: status, start (open `auth_url`, poll `signInStatus`), sign out.
+     * In dev demo mode with `chatgpt=1` the status and model list are a fake sign-in (lib/demo.ts). */
+    chatgpt: {
+      status: () => (isDemoChatGPT() ? Promise.resolve(demo.chatgptStatus()) : http.get<ChatGPTStatus>('/api/models/connect/chatgpt')),
+      connect: () => http.post<ProviderSignIn>('/api/models/connect/chatgpt'),
+      signOut: () => http.delete<OkResponse>('/api/models/connect/chatgpt'),
+      /** The one-time welcome message was shown. */
+      welcomed: () => (isDemoChatGPT() ? Promise.resolve(demo.chatgptWelcomed()) : http.post<OkResponse>('/api/models/connect/chatgpt/welcome'))
+    },
+    checkKey: (provider: string) => http.post<ProviderKeyCheck>(`/api/models/connect/${enc(provider)}/check`),
+    catalog: (provider: string) =>
+      provider === 'chatgpt' && isDemoChatGPT() ? Promise.resolve(demo.chatgptCatalog()) : http.get<CatalogModel[]>(`/api/models/catalog/${enc(provider)}`),
+    /** Model presets: switch every role at once, save your own, undo the last switch. */
+    presets: {
+      list: () => http.get<ModelPresetList>('/api/models/presets'),
+      apply: (name: string, localOnly = false) =>
+        http.post<PresetApplyResult>(`/api/models/presets/${enc(name)}/apply`, localOnly ? { local_only: true } : undefined),
+      undo: () => http.post<PresetApplyResult>('/api/models/presets/undo'),
+      save: (name: string, overwrite = false) => http.post<ModelPreset>('/api/models/presets', { name, overwrite }),
+      rename: (name: string, to: string) => http.patch<ModelPreset>(`/api/models/presets/${enc(name)}`, { name: to }),
+      delete: (name: string) => http.delete<OkResponse>(`/api/models/presets/${enc(name)}`)
+    }
+  },
+
+  secrets: {
+    list: () => http.get<SecretStatus[]>('/api/secrets'),
+    set: (name: string, value: string) => http.put<OkResponse>(`/api/secrets/${enc(name)}`, { value }),
+    delete: (name: string) => http.delete<OkResponse>(`/api/secrets/${enc(name)}`)
+  },
+
+  // §4 tasks -------------------------------------------------------------------
+  tasks: {
+    list: () => http.get<Task[]>('/api/tasks'),
+    away: () => http.get<AwayStatus>('/api/tasks/away'),
+    awayResume: () => http.post<{ resumed: number; status: AwayStatus }>('/api/tasks/away/resume'),
+    awayKeep: () => http.post<AwayStatus>('/api/tasks/away/keep'),
+    /** Tasks by email (#159). */
+    email: (limit = 20) => http.get<EmailTasksStatus>(`/api/tasks/email?limit=${limit}`),
+    get: (id: string) => http.get<Task>(`/api/tasks/${enc(id)}`),
+    create: (body: TaskCreateRequest) => http.post<Task>('/api/tasks', body),
+    preview: (prompt: string) => http.post<TaskPreview>('/api/tasks/preview', { prompt }),
+    update: (id: string, patch: TaskPatch) => http.patch<Task>(`/api/tasks/${enc(id)}`, patch),
+    delete: (id: string) => http.delete<OkResponse>(`/api/tasks/${enc(id)}`),
+    approve: (id: string) => http.post<Task>(`/api/tasks/${enc(id)}/approve`),
+    decline: (id: string) => http.post<Task>(`/api/tasks/${enc(id)}/decline`),
+    rerun: (id: string) => http.post<Task>(`/api/tasks/${enc(id)}/rerun`),
+    runNow: (id: string) => http.post<Task>(`/api/tasks/${enc(id)}/run-now`),
+    /** Try it first (#142): a run that only notes what it would send, change or run. */
+    dryRun: (id: string) => http.post<Task>(`/api/tasks/${enc(id)}/dry-run`),
+    archive: (id: string) => http.post<Task>(`/api/tasks/${enc(id)}/archive`),
+    chat: (id: string, message: string) => http.post<Task>(`/api/tasks/${enc(id)}/chat`, { message }),
+    answerClarifications: (id: string, answers: ClarificationAnswer[]) =>
+      http.post<Task>(`/api/tasks/${enc(id)}/clarifications`, { answers }),
+    cancelRun: (id: string, runId: string) => http.post<Task>(`/api/tasks/${enc(id)}/runs/${enc(runId)}/cancel`),
+    /** Answer the question a `waiting_for_user` run asked; the run carries on. 409 when it is not waiting, 400 when empty. */
+    answerQuestion: (id: string, runId: string, answer: string) =>
+      http.post<Task>(`/api/tasks/${enc(id)}/runs/${enc(runId)}/answer`, { answer }),
+    runEvents: (id: string, runId: string) =>
+      http.get<ProgressUpdate[]>(`/api/tasks/${enc(id)}/runs/${enc(runId)}/events`),
+    /** Failed or cancelled run of a non-swarm task: a new run with `retry_of`. 409 otherwise. */
+    retryRun: (id: string, runId: string) => http.post<Task>(`/api/tasks/${enc(id)}/runs/${enc(runId)}/retry`),
+    /** §16 script jobs: runs the stored script, or `code` (unsaved edits), once. 400 when the code does not compile. */
+    testScript: (id: string, code?: string) =>
+      withDemoFallback(() => http.post<SandboxResult>(`/api/tasks/${enc(id)}/script/test`, code !== undefined ? { code } : undefined), () => demo.scriptTest(id)),
+    /** `PATCH /api/tasks/{id}` with a partial `script`; 400 when the code does not compile. */
+    updateScript: (id: string, script: Partial<Pick<TaskScript, 'condition' | 'then' | 'code'>>) =>
+      withDemoFallback(() => http.patch<Task>(`/api/tasks/${enc(id)}`, { script }), () => demo.patchScript(id, script))
+  },
+
+  // §5 integrations ------------------------------------------------------------
+  integrations: {
+    /** Replace the MCP-only key (#443): apps holding the old one stop working until they restart. */
+    replaceMcpKey: () => http.post<{ rotated: boolean }>('/api/mcp/token/rotate'),
+    list: () => http.get<Integration[]>('/api/integrations'),
+    get: (id: string) => http.get<Integration>(`/api/integrations/${enc(id)}`),
+    connect: (id: string, fields: Record<string, string> = {}, access?: ConnectionAccess) =>
+      http.post<ConnectResponse>(`/api/integrations/${enc(id)}/connect`, access ? { fields, access } : { fields }),
+    /** Read only or Read and write (#141). Takes effect at once. */
+    setAccess: (id: string, access: ConnectionAccess) => http.put<Integration>(`/api/integrations/${enc(id)}/access`, { access }),
+    /** ``forget``: also forget what Sentient learned from it (#153). */
+    disconnect: (id: string, forget = false) =>
+      http.post<Integration & Forgotten>(`/api/integrations/${enc(id)}/disconnect`, undefined, forget ? { query: { forget: true } } : undefined),
+    /** Abandon a pending browser sign-in so the integration stops showing "connecting". */
+    cancel: (id: string) => http.post<Integration>(`/api/integrations/${enc(id)}/cancel`),
+    test: (id: string) => http.post<IntegrationTestResult>(`/api/integrations/${enc(id)}/test`),
+    getPrivacyFilters: (id: string) => http.get<PrivacyFilters>(`/api/integrations/${enc(id)}/privacy-filters`),
+    setPrivacyFilters: (id: string, filters: PrivacyFilters) =>
+      http.put<OkResponse>(`/api/integrations/${enc(id)}/privacy-filters`, filters),
+    /** #175: the devices of an integration with an entity picker, and which ones Sentient may use. */
+    getEntities: (id: string) => http.get<IntegrationEntities>(`/api/integrations/${enc(id)}/entities`),
+    setEntities: (id: string, choice: EntityChoice) => http.put<EntityChoice>(`/api/integrations/${enc(id)}/entities`, choice),
+    mcp: {
+      list: () => http.get<McpServer[]>('/api/integrations/mcp'),
+      add: (body: McpServerCreate) => http.post<McpServer>('/api/integrations/mcp', body),
+      remove: (name: string, forget = false) =>
+        http.delete<OkResponse & Forgotten>(`/api/integrations/mcp/${enc(name)}`, forget ? { query: { forget: true } } : undefined),
+      test: (name: string) => http.post<McpTestResult>(`/api/integrations/mcp/${enc(name)}/test`),
+      signIn: (name: string) => http.post<McpSignInStart>(`/api/integrations/mcp/${enc(name)}/sign-in`),
+      signOut: (name: string) => http.post<McpServer>(`/api/integrations/mcp/${enc(name)}/sign-out`),
+      setEnabled: (name: string, enabled: boolean) => http.post<McpServer>(`/api/integrations/mcp/${enc(name)}/enabled`, { enabled }),
+      setAccess: (name: string, access: ConnectionAccess) => http.post<McpServer>(`/api/integrations/mcp/${enc(name)}/access`, { access }),
+      /** Approve or decline tools after the safety check (#146), by their name on the server. */
+      review: (name: string, decisions: Record<string, 'approve' | 'decline'>) =>
+        http.post<McpServer>(`/api/integrations/mcp/${enc(name)}/review`, { decisions }),
+      /** Fill in the server's own header or env values (keychain only), then it reconnects. */
+      setValues: (name: string, values: Record<string, string>, enable = false) =>
+        http.post<McpServer>(`/api/integrations/mcp/${enc(name)}/values`, { values, enable })
+    },
+    /** §16 change feeds (Gmail, Calendar) and IMAP push watchers. */
+    feeds: {
+      list: () => withDemoFallback(() => http.get<FeedStatus[]>('/api/integrations/feeds'), () => DEMO_FEEDS),
+      sync: (source: string) => http.post<{ ok: boolean; emitted?: number; error?: string }>(`/api/integrations/feeds/${enc(source)}/sync`)
+    }
+  },
+
+  // §6 notifications & proactivity ---------------------------------------------
+  notifications: {
+    list: (opts: { limit?: number; unread_only?: boolean } = {}) =>
+      http.get<NotificationList>('/api/notifications', { query: opts }),
+    markRead: (id: string) => http.post<OkResponse>(`/api/notifications/${enc(id)}/read`),
+    markAllRead: () => http.post<OkResponse>('/api/notifications/read-all'),
+    delete: (id: string) => http.delete<OkResponse>(`/api/notifications/${enc(id)}`),
+    clear: () => http.delete<OkResponse>('/api/notifications')
+  },
+
+  proactivity: {
+    respond: (notificationId: string, action: 'approve' | 'dismiss') =>
+      http.post<SuggestionActionResponse>(`/api/proactivity/suggestions/${enc(notificationId)}`, { action }),
+    status: () => http.get<ProactivityStatus>('/api/proactivity/status'),
+    pollNow: () => http.post<{ ok: boolean; events: number }>('/api/proactivity/poll-now'),
+    preferences: () => http.get<ProactivityPreference[]>('/api/proactivity/preferences'),
+    resetPreference: (suggestionType: string) =>
+      http.delete<OkResponse>(`/api/proactivity/preferences/${enc(suggestionType)}`),
+    /** Daily Brief: a recurring task the user can edit, pause or delete in Tasks. */
+    brief: {
+      get: () => http.get<BriefState>('/api/proactivity/brief'),
+      /** Set it up (creates the task once) or change time, days, sections and topics. */
+      setup: (body: BriefSetup = {}) => http.post<BriefState>('/api/proactivity/brief', body),
+      runNow: (kind: BriefKind = 'morning') => http.post<{ ok: boolean; task_id: string }>('/api/proactivity/brief/run', { kind }),
+      feedback: (body: { brief_id: string; value: BriefFeedback; item_id?: string; section?: BriefSectionId }) =>
+        http.post<Brief>('/api/proactivity/brief/feedback', body)
+    }
+  },
+
+  // §7 memory ------------------------------------------------------------------
+  memories: {
+    list: (query: MemoryQuery = {}) => http.get<Memory[]>('/api/memories', { query: { ...query } }),
+    topics: () => http.get<MemoryTopic[]>('/api/memories/topics'),
+    graph: () => http.get<MemoryGraph>('/api/memories/graph'),
+    create: (content: string, source?: string, scope?: string) => http.post<MemoryWriteResult>('/api/memories', { content, source, scope }),
+    /** §7 memory scopes (#155): Always, Personal, Work and the user's projects, with counts. */
+    scopes: () => http.get<MemoryScope[]>('/api/memories/scopes'),
+    move: (id: number, scope: string) => http.patch<Memory>(`/api/memories/${id}`, { scope }),
+    /** #152: one memory with every source and exactly where it said it. */
+    get: (id: number) => http.get<Memory>(`/api/memories/${id}`),
+    /** #152: the user says a memory isn't right (`disputed`, kept out of chats and tasks) or is (`current`). */
+    setState: (id: number, state: 'current' | 'disputed') => http.patch<Memory>(`/api/memories/${id}`, { state }),
+    resetScope: (scope: string) => http.delete<{ deleted: number }>(`/api/memories/scope/${enc(scope)}`),
+    update: (id: number, content: string) => http.put<Memory>(`/api/memories/${id}`, { content }),
+    /** `cleanup_pending`: deleted, but some of what came from it is removed by the next hourly upkeep (#534). */
+    delete: (id: number) => http.delete<{ deleted: boolean; cleanup_pending?: boolean }>(`/api/memories/${id}`),
+    deleteBySource: (source: string) => http.delete<{ deleted: number; unlinked: number }>(`/api/memories/source/${enc(source)}`),
+    /** What disconnecting ``source`` with "Also forget" would delete (#153): app:<id>, channel:<id>, device:<id>, folder:<id>. */
+    forgetPreview: (source: string) => http.get<ForgetCounts>('/api/memories/forget-preview', { query: { source } }),
+    export: (format: 'markdown' | 'sqlite') => http.post<MemoryExport>('/api/memories/export', { format }),
+    import: (file: File, opts?: UploadOptions) =>
+      upload<MemoryImportResult>('/api/memories/import', file, file.name, opts),
+    summaries: (limit?: number) => http.get<MemorySummary[]>('/api/memories/summaries', { query: { limit } }),
+    workspace: () => http.get<WorkspaceSnapshot>('/api/memories/workspace'),
+    writeWorkspace: (which: WorkspaceFileId, content: string) =>
+      http.put<{ saved: boolean }>(`/api/memories/workspace/${which}`, { content }),
+    personas: () => http.get<Persona[]>('/api/memories/personas'),
+    /** §7 memories waiting for the user's review (ADR 0021). */
+    review: {
+      list: () => http.get<MemoryReviewInbox>('/api/memories/review'),
+      approve: (kind: 'fact' | 'insight', id: number | string, content?: string) =>
+        http.post<OkResponse>(`/api/memories/review/${kind}/${enc(String(id))}/approve`, content === undefined ? {} : { content }),
+      discard: (kind: 'fact' | 'insight', id: number | string) => http.delete<OkResponse>(`/api/memories/review/${kind}/${enc(String(id))}`),
+      approveAll: (from: string) => http.post<{ approved: number }>('/api/memories/review/approve-all', { from }),
+      /** Bring back a memory the nightly tidy-up merged into another one (#353). 404 when it isn't merged. */
+      undoMerge: (id: number) => http.post<OkResponse>(`/api/memories/review/merged/${enc(String(id))}/undo`)
+    },
+    /** §15 dreams: overnight memory consolidation. */
+    dreams: {
+      list: (limit = 30) => withDemoFallback(() => http.get<Dream[]>('/api/memories/dreams', { query: { limit } }), () => demo.dreams()),
+      run: () => withDemoFallback(() => http.post<Dream>('/api/memories/dreams/run'), () => demo.runDream())
+    }
+  },
+
+  // §8 skills & self-evolution ---------------------------------------------------
+  skills: {
+    list: () => http.get<SkillsList>('/api/skills'),
+    get: (name: string) => http.get<SkillDetail>(`/api/skills/${enc(name)}`),
+    create: (body: SkillCreate) => http.post<Skill>('/api/skills', body),
+    update: (name: string, body: SkillUpdate) => http.put<Skill>(`/api/skills/${enc(name)}`, body),
+    /** `acceptRisk`: approve a skill whose safety check found high-risk problems anyway (#146). */
+    approve: (name: string, acceptRisk = false) =>
+      http.post<Skill>(`/api/skills/${enc(name)}/approve`, acceptRisk ? { accept_risk: true } : undefined),
+    /** Add a skill from a web address; it waits in pending with its safety check (#146). */
+    importUrl: (url: string) => http.post<SkillDetail>('/api/skills/import', { url }),
+    /** `/learn` (#167): draft a skill from a web page, a file or a folder; it waits in pending. */
+    learn: (source: string) => http.post<SkillDetail>('/api/skills/learn', { source }),
+    reject: (name: string) => http.post<OkResponse>(`/api/skills/${enc(name)}/reject`),
+    archive: (name: string) => http.post<Skill>(`/api/skills/${enc(name)}/archive`),
+    restore: (name: string) => http.post<Skill>(`/api/skills/${enc(name)}/restore`),
+    reset: (name: string) => http.post<SkillDetail>(`/api/skills/${enc(name)}/reset`),
+    delete: (name: string) => http.delete<OkResponse>(`/api/skills/${enc(name)}`),
+    diff: (name: string) => http.get<SkillDiff>(`/api/skills/${enc(name)}/diff`),
+    reviewNow: (session_id?: string) => http.post<SkillReviewResult>('/api/skills/review-now', { session_id }),
+    evolutionLog: (limit?: number) =>
+      http.get<EvolutionLogEntry[]>('/api/skills/evolution-log', { query: { limit } }),
+    /** The Skills hub (#210): browse sources, preview, install into review, updates pinned in the lockfile. */
+    hub: {
+      sources: () => http.get<HubSource[]>('/api/skills/hub/sources'),
+      addSource: (url: string, name?: string) => http.post<HubSource>('/api/skills/hub/sources', { url, name }),
+      removeSource: (id: string) => http.delete<OkResponse>(`/api/skills/hub/sources/${enc(id)}`),
+      browse: (source: string, refresh = false) => http.get<HubListing>('/api/skills/hub/browse', { query: { source, refresh: refresh || undefined } }),
+      preview: (source: string, path: string) => http.get<HubPreview>('/api/skills/hub/preview', { query: { source, path } }),
+      /** 409 with `code` `confirm_source` or `high_risk` asks for the extra yes (`hubConfirmCode`). */
+      install: (body: HubInstall) => http.post<SkillDetail>('/api/skills/hub/install', body),
+      installed: (check = false) => http.get<{ skills: HubInstalled[] }>('/api/skills/hub/installed', { query: { check: check || undefined } }),
+      update: (name: string, acceptRisk = false) => http.post<HubUpdateResult>(`/api/skills/hub/update/${enc(name)}`, acceptRisk ? { accept_risk: true } : undefined)
+    }
+  },
+
+  // §9 voice ---------------------------------------------------------------------
+  voice: {
+    status: () => http.get<VoiceStatus>('/api/voice/status'),
+    transcribe: (audio: Blob, filename = 'dictation.webm', opts?: UploadOptions) =>
+      upload<TranscribeResult>('/api/voice/transcribe', audio, filename, opts),
+    /** Local speech recognition plus the cleanup in `voice.dictation` (#169). The listening pill calls it directly. */
+    dictate: (audio: Blob, filename = 'dictation.webm', opts?: UploadOptions) =>
+      upload<DictateResult>('/api/voice/dictate', audio, filename, opts),
+    speak: (text: string, voice?: string) => http.blob('POST', '/api/voice/speak', { body: { text, voice } }),
+    prepare: (target: VoicePrepareTarget = 'all', signal?: AbortSignal) =>
+      streamNdjson<VoicePrepareProgress>('POST', '/api/voice/prepare', { body: { target }, signal }),
+    /** `WS /ws/voice?token=` URL. */
+    socketUrl: () => {
+      const conn = connection
+      return conn ? `${conn.baseUrl.replace(/^http/, 'ws')}/ws/voice?token=${enc(conn.token)}` : ''
+    }
+  },
+
+  // §10 subagents ------------------------------------------------------------------
+  subagents: {
+    forSession: (sessionId: string) => http.get<Subagent[]>(`/api/sessions/${enc(sessionId)}/subagents`),
+    get: (id: string) => http.get<Subagent>(`/api/subagents/${enc(id)}`),
+    cancel: (id: string) => http.post<Subagent>(`/api/subagents/${enc(id)}/cancel`)
+  },
+
+  // §11 code execution --------------------------------------------------------------
+  sandbox: {
+    status: () =>
+      withDemoFallback(
+        () => http.get<SandboxStatus>('/api/sandbox/status'),
+        () => ({ enabled: true, backend: 'process', docker_available: false, python_version: '3.12.7' })
+      ),
+    run: (code: string) => http.post<SandboxResult>('/api/sandbox/run', { code })
+  },
+
+  // §18 terminal ------------------------------------------------------------------------
+  terminal: {
+    status: () => http.get<TerminalStatus>('/api/terminal/status'),
+    /** Kills one running command; `id` is the tool call id. */
+    stop: (id: string) => http.post<{ stopped: boolean }>('/api/terminal/stop', { id })
+  },
+
+  // §12 browser -------------------------------------------------------------------------
+  browser: {
+    status: () => http.get<BrowserStatus>('/api/browser/status'),
+    /** Shows a visible window on a browser profile so the user can sign in themselves (attach profiles: a new tab). */
+    open: (url?: string, profile?: string) => http.post<BrowserStatus>('/api/browser/open', { ...(url ? { url } : {}), ...(profile ? { profile } : {}) }),
+    profiles: () => http.get<BrowserProfiles>('/api/browser/profiles'),
+    createProfile: (body: BrowserProfileCreate) => http.post<BrowserProfiles>('/api/browser/profiles', body),
+    updateProfile: (name: string, patch: BrowserProfilePatch) => http.patch<BrowserProfiles>(`/api/browser/profiles/${enc(name)}`, patch),
+    deleteProfile: (name: string) => http.delete<BrowserProfiles>(`/api/browser/profiles/${enc(name)}`),
+    close: () => http.post<BrowserStatus>('/api/browser/close'),
+    screenshotUrl: (bust?: number) => authedUrl('/api/browser/screenshot', { t: bust })
+  },
+
+  // §13 devices ---------------------------------------------------------------------------
+  nodes: {
+    list: () => http.get<DeviceNode[]>('/api/nodes'),
+    get: (id: string) => http.get<DeviceNode>(`/api/nodes/${enc(id)}`),
+    rename: (id: string, name: string) => http.patch<DeviceNode>(`/api/nodes/${enc(id)}`, { name }),
+    remove: (id: string, forget = false) => http.delete<OkResponse & Forgotten>(`/api/nodes/${enc(id)}`, forget ? { query: { forget: true } } : undefined),
+    invoke: (id: string, capability: string, params: Record<string, unknown> = {}, timeout_ms?: number) =>
+      http.post<DeviceInvokeResult>(`/api/nodes/${enc(id)}/invoke`, { capability, params, timeout_ms }),
+    /** `replaces`: the code on screen, which stops working when the new one is made (#477). */
+    pairing: (replaces?: string) => http.post<DevicePairing>('/api/nodes/pairing', replaces ? { replaces } : undefined),
+    lan: () => http.get<DeviceLanInfo>('/api/nodes/lan')
+  },
+
+  // §14 messaging channels ------------------------------------------------------------------
+  channels: {
+    list: () => http.get<Channel[]>('/api/channels'),
+    connect: (id: string, fields: Record<string, string>) => http.post<Channel>(`/api/channels/${enc(id)}/connect`, { fields }),
+    disconnect: (id: string, forget = false) =>
+      http.post<Channel & Forgotten>(`/api/channels/${enc(id)}/disconnect`, undefined, forget ? { query: { forget: true } } : undefined),
+    pairing: (id: string) => http.post<ChannelPairing>(`/api/channels/${enc(id)}/pairing`),
+    setDeliver: (id: string, chatId: string, deliver: boolean) =>
+      http.patch<Channel>(`/api/channels/${enc(id)}/paired/${enc(chatId)}`, { deliver }),
+    removePaired: (id: string, chatId: string) => http.delete<Channel>(`/api/channels/${enc(id)}/paired/${enc(chatId)}`),
+    test: (id: string, chatId?: string) => http.post<{ ok: boolean; error?: string }>(`/api/channels/${enc(id)}/test`, chatId ? { chat_id: chatId } : {})
+  },
+
+  // §15 user model ------------------------------------------------------------------------
+  userModel: {
+    get: () => withDemoFallback(() => http.get<UserModel>('/api/user-model'), () => demo.userModel()),
+    addInsight: (statement: string, dimension: InsightDimension | string) =>
+      withDemoFallback(() => http.post<Insight>('/api/user-model/insights', { statement, dimension }), () => demo.addInsight(statement, dimension)),
+    patchInsight: (id: string, patch: { statement?: string; status?: InsightStatus }) =>
+      withDemoFallback(() => http.patch<Insight>(`/api/user-model/insights/${enc(id)}`, patch), () => demo.patchInsight(id, patch)),
+    deleteInsight: (id: string) =>
+      withDemoFallback(() => http.delete<{ ok: boolean }>(`/api/user-model/insights/${enc(id)}`), () => demo.deleteInsight(id)),
+    refresh: () =>
+      withDemoFallback(() => http.post<UserModelRefreshResult>('/api/user-model/refresh'), () => ({ added: 1, updated: 2, disputed: 0, questions: 1 })),
+    answerQuestion: (id: string, answer: string) =>
+      withDemoFallback(() => http.post<{ ok: boolean }>(`/api/user-model/questions/${enc(id)}`, { answer }), () => demo.dropQuestion(id)),
+    dismissQuestion: (id: string) =>
+      withDemoFallback(() => http.delete<{ ok: boolean }>(`/api/user-model/questions/${enc(id)}`), () => demo.dropQuestion(id))
+  },
+
+  // §19 moving from Hermes ------------------------------------------------------------------
+  imports: {
+    hermes: {
+      info: () => http.get<{ path: string; exists: boolean }>('/api/import/hermes'),
+      preview: (path?: string) => http.post<HermesPreview>('/api/import/hermes/preview', { path: path || null }),
+      apply: (body: { path?: string; parts: HermesPart[]; skip?: string[] }) => http.post<HermesResult>('/api/import/hermes/apply', body),
+      removeMemories: () => http.delete<{ facts: number; insights: number }>('/api/import/hermes/memories')
+    },
+    memory: {
+      info: (app: MemoryImportApp) => http.get<{ path: string | null; exists: boolean }>(`/api/import/${app}`),
+      preview: (app: MemoryImportApp, path: string) => http.post<MemoryImportPreview>(`/api/import/${app}/preview`, { path }),
+      apply: (app: MemoryImportApp, body: { path: string; parts: string[]; skip?: string[] }) =>
+        http.post<MemoryImportJob>(`/api/import/${app}/apply`, body),
+      job: () => http.get<MemoryImportJob | null>('/api/import/memory/job'),
+      cancel: () => http.post<MemoryImportJob | null>('/api/import/memory/job/cancel', {}),
+      remove: (app: MemoryImportApp) => http.delete<{ facts: number; insights: number }>(`/api/import/${app}/memories`)
+    }
+  },
+
+  // §20 backups, restore and snapshots ------------------------------------------------------
+  backups: {
+    get: () => http.get<BackupOverview>('/api/backups'),
+    create: (folder?: string) => http.post<BackupEntry>('/api/backups', { folder: folder || null }),
+    inspect: (path: string) => http.post<BackupInspect>('/api/backups/inspect', { path }),
+    restore: (path: string) => http.post<RestoreStaged>('/api/backups/restore', { path }),
+    cancelRestore: () => http.delete<{ cancelled: boolean }>('/api/backups/restore'),
+    dismissLastRestore: () => http.delete<{ ok: boolean }>('/api/backups/last-restore')
+  },
+
+  // §22 folders and Obsidian vaults as searchable notes (#176) -------------------------------------------------
+  folders: {
+    list: () => http.get<FoldersOverview>('/api/folders'),
+    add: (path: string, ignore?: string[]) => http.post<WatchedFolder>('/api/folders', { path, ignore }),
+    update: (id: string, ignore: string[]) => http.patch<WatchedFolder>(`/api/folders/${id}`, { ignore }),
+    setScope: (id: string, scope: string) => http.patch<WatchedFolder>(`/api/folders/${id}`, { scope }),
+    remove: (id: string, forget = false) =>
+      http.delete<{ removed: boolean } & Forgotten>(`/api/folders/${id}`, forget ? { query: { forget: true } } : undefined),
+    rescan: (id: string) => http.post<{ queued: boolean }>(`/api/folders/${id}/rescan`, {})
+  },
+
+  // §21 activity timeline ---------------------------------------------------------------------
+  timeline: {
+    past: (filters: TimelineFilters = {}, before?: string | null, limit = 50) =>
+      http.get<TimelinePage>('/api/timeline', { query: { ...timelineQuery(filters), before: before ?? undefined, limit } }),
+    upcoming: (filters: TimelineFilters = {}, days = 7) =>
+      http.get<TimelineUpcoming>('/api/timeline/upcoming', { query: { ...timelineQuery(filters), days } }),
+    apps: () => http.get<{ apps: Array<{ id: string; label: string }> }>('/api/timeline/apps'),
+    /** Bring back what a chat moved to the trash (#142); offered when an item has `undo`. */
+    restore: (id: string) => http.post<{ ok: boolean; result?: unknown; message?: string }>('/api/timeline/restore', { id }),
+    /** Cancel a timer or reminder that has not gone off yet (#150); offered when `undo.action` is 'cancel'. */
+    cancel: (id: string) => http.post<{ ok: boolean; reminder?: Reminder }>('/api/timeline/cancel', { id })
+  },
+
+  // §23 timers and reminders (#150) -------------------------------------------------------------
+  reminders: {
+    list: (status: ReminderStatus | 'all' = 'scheduled') => http.get<{ reminders: Reminder[] }>('/api/reminders', { query: { status } }),
+    cancel: (id: string) => http.post<Reminder>(`/api/reminders/${enc(id)}/cancel`),
+    /** Stop a ringing alarm (#390). */
+    stop: (id: string) => http.post<Reminder>(`/api/reminders/${enc(id)}/stop`),
+    /** Snooze a ringing alarm (#390); minutes default to the snooze setting. */
+    snooze: (id: string, minutes?: number) => http.post<SnoozedAlarm>(`/api/reminders/${enc(id)}/snooze`, minutes ? { minutes } : {})
+  },
+
+  // §16 webhooks --------------------------------------------------------------------------
+  hooks: {
+    list: () => withDemoFallback(() => http.get<Hook[]>('/api/hooks'), () => demo.hooks()),
+    create: (name: string) => withDemoFallback(() => http.post<HookCreated>('/api/hooks', { name }), () => demo.createHook(name)),
+    delete: (id: string) => withDemoFallback(() => http.delete<{ ok: boolean }>(`/api/hooks/${enc(id)}`), () => demo.deleteHook(id))
+  }
+} as const
+
+export type Api = typeof api

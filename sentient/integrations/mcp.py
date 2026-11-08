@@ -1,0 +1,1141 @@
+"""MCP client: attach external MCP servers and expose their tools as ordinary Sentient tools.
+
+Servers come from ``config.integrations.mcp_servers``::
+
+    {name: {transport: "stdio" | "http", command, args, url, env, env_keys, enabled,
+            auth: "none" | "headers" | "oauth", header_keys}}
+
+Environment values added through the API are stored in the keychain (``mcp:<name>``);
+config keeps only their names in ``env_keys``. Remote (http) servers can carry static
+headers (values in the keychain, names in ``header_keys``) and can sign in with the MCP
+authorization spec (OAuth 2.1 + PKCE, see ``mcp_auth``). The browser sign-in comes back to
+the shared loopback listener of the integration manager. Each server runs in its own
+background task that connects, lists tools, registers them as ``mcp_<server>_<tool>`` and
+reconnects with backoff when the connection drops. Startup never waits for a server.
+
+Safety check (#146, ``mcp_vet``): every time a server connects, each tool is checked and hashed. Only tools whose
+exact hash the user approved are registered; new tools and tools whose description changed are held back and shown
+in ``review``, and a change raises a notification. Servers configured before reviews existed are trusted as they are
+the first time they connect (``meta.mcp_review_baseline``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import functools
+import hashlib
+import ipaddress
+import json
+import logging
+import re
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+from urllib.parse import parse_qs, urlsplit
+
+from sentient.integrations import mcp_vet
+from sentient.integrations.base import IntegrationError, JsonSchemaTool
+from sentient.integrations.common import delete_secret, load_secret_json, store_secret_json
+from sentient.integrations.mcp_auth import (
+    SERVER_URL_KEY,
+    KeychainTokenStorage,
+    NeedsSignIn,
+    SentientOAuthProvider,
+    SignInFailed,
+    canonical_url,
+    client_metadata,
+    client_secret,
+    delete_json,
+    forget_server,
+    headers_secret,
+    load_json,
+    migrate_server_credentials,
+    save_json,
+    stale_sign_in,
+    tokens_secret,
+)
+from sentient.integrations.mcp_shorten import shortener_for
+from sentient.store.db import now_iso
+from sentient.tools.base import Risk, ToolContext, ToolPlugin
+
+if TYPE_CHECKING:  # pragma: no cover
+    from sentient.integrations.service import IntegrationManager
+
+log = logging.getLogger(__name__)
+
+MAX_TOOL_NAME = 64
+CONNECT_TIMEOUT_S = 30
+MIN_BACKOFF_S = 2.0
+MAX_BACKOFF_S = 300
+SIGN_IN_TTL_S = 15 * 60
+AUTH_MODES = ("none", "headers", "oauth")
+HEADER_NAME = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,128}$")
+BASELINE_KEY = "mcp_review_baseline"
+SIGN_IN_MESSAGES = {
+    "none": "This server asks you to sign in.",
+    "headers": "The server didn't accept the saved headers. Change their values with the key button on the server.",
+    "oauth": "Sign in to use this server.",
+}
+
+
+def sanitize(value: str) -> str:
+    return re.sub(r"_+", "_", re.sub(r"[^a-z0-9_]", "_", value.lower())).strip("_") or "x"
+
+
+def mcp_tool_name(server: str, tool: str) -> str:
+    name = f"mcp_{sanitize(server)}_{sanitize(tool)}"
+    if len(name) > MAX_TOOL_NAME:
+        digest = hashlib.sha1(name.encode()).hexdigest()[:8]
+        name = f"{name[: MAX_TOOL_NAME - 9]}_{digest}"
+    return name
+
+
+def plugin_id_for(server: str) -> str:
+    return f"mcp_{sanitize(server)}"
+
+
+class MCPServerPlugin(ToolPlugin):
+    auth = "mcp"
+    category = "utilities"
+    icon = "plug"
+
+    def __init__(self, server: str, tools: list, description: str = "") -> None:
+        self.id = plugin_id_for(server)
+        self.display_name = server
+        self.description = description or f"Tools from the external MCP server '{server}'."
+        self.selection_hint = f"tools provided by the {server} MCP server"
+        self.tools = tools
+        super().__init__()
+
+
+@dataclass
+class SignInFlow:
+    server: str
+    url: asyncio.Future
+    code: asyncio.Future
+    state: str = ""
+    task: asyncio.Task | None = None
+    created: float = field(default_factory=time.time)
+
+
+@dataclass
+class Probe:
+    """What one connection attempt saw: did the MCP endpoint answer 401?"""
+
+    unauthorized: bool = False
+
+
+@dataclass
+class ServerConn:
+    name: str
+    spec: dict
+    status: str = "disconnected"  # disconnected | connecting | connected | needs_sign_in | error | disabled
+    error: str | None = None
+    signin: SignInFlow | None = None
+    refresh_tried: bool = False
+    tools: list[dict] = field(default_factory=list)  # [{name, mcp_name, description, risk}]
+    client: Any = None
+    task: asyncio.Task | None = None
+    stop: asyncio.Event = field(default_factory=asyncio.Event)
+    broken: asyncio.Event = field(default_factory=asyncio.Event)
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    plugin: MCPServerPlugin | None = None
+    listed: list = field(default_factory=list)  # the tools the server listed on its last connection
+    review: dict | None = None  # the safety check of those tools (#146)
+
+
+def _risk_for(tool: Any) -> Risk:
+    ann = getattr(tool, "annotations", None)
+    if ann is not None and getattr(ann, "read_only_hint", None):
+        return Risk.read
+    if ann is not None and getattr(ann, "destructive_hint", None) is True:
+        return Risk.send
+    return Risk.write
+
+
+# A tool that runs other tools named by a slug, with their arguments (Composio's COMPOSIO_MULTI_EXECUTE_TOOL takes
+# {"tools": [{"tool_slug": "GMAIL_SEND_EMAIL", "arguments": {...}}]}), is only as risky as the tools it runs (#141).
+SLUG_KEYS = frozenset({"tool_slug", "action_slug", "slug"})
+SLUG_ARGUMENT_KEYS = frozenset({"arguments", "args", "params", "parameters", "input"})
+_SLUG_VERBS: dict[str, Risk] = {
+    **dict.fromkeys(("GET", "LIST", "FETCH", "SEARCH", "FIND", "READ", "RETRIEVE", "QUERY", "VIEW", "DESCRIBE",
+                     "LOOKUP", "COUNT"), Risk.read),
+    **dict.fromkeys(("CREATE", "UPDATE", "ADD", "SET", "EDIT", "MODIFY", "PATCH", "PUT", "INSERT", "UPLOAD", "MOVE",
+                     "ARCHIVE", "MARK", "STAR", "ASSIGN", "CLOSE", "RENAME", "COPY", "APPEND", "REPLACE", "UPSERT",
+                     "SAVE", "ENABLE", "DISABLE", "START", "STOP", "SCHEDULE", "CLEAR", "LABEL", "UNSUBSCRIBE"),
+                    Risk.write),
+    **dict.fromkeys(("SEND", "REPLY", "FORWARD", "POST", "DELETE", "REMOVE", "TRASH", "PUBLISH", "INVITE", "SHARE",
+                     "MERGE", "TRANSFER", "PAY", "PURCHASE", "CANCEL", "APPROVE", "REJECT", "DECLINE"), Risk.send),
+    **dict.fromkeys(("EXECUTE", "RUN", "EVAL"), Risk.exec),
+}
+# words that are also nouns ("GITHUB_GET_A_WORKFLOW_RUN", "WORDPRESS_GET_POST"): they count only as the first verb
+_SLUG_NOUNS_TOO = frozenset({"RUN", "POST", "LABEL", "STAR", "SHARE", "COPY", "SCHEDULE"})
+
+
+def slug_risk(slug: str) -> Risk:
+    """Risk of one tool named by a slug such as ``GMAIL_SEND_EMAIL`` (send) or ``GITHUB_LIST_ISSUES`` (read).
+
+    The first verb after the app name decides, and any later verb that changes things raises it. A slug with no
+    known verb counts as ``write``, so only a plain look-up ever comes out as ``read``."""
+    tokens = [t for t in re.split(r"[^A-Z0-9]+", str(slug or "").upper()) if t]
+    verbs = [(t, _SLUG_VERBS[t]) for t in (tokens[1:] if len(tokens) > 1 else tokens) if t in _SLUG_VERBS]
+    if not verbs:
+        return Risk.write
+    return max([verbs[0][1], *(r for t, r in verbs[1:] if t not in _SLUG_NOUNS_TOO)])
+
+
+def _runs_slugs(schema: Any) -> bool:
+    """True when an input schema has an object with a slug and its arguments (a tool that runs other tools)."""
+    if isinstance(schema, dict):
+        props = schema.get("properties")
+        if isinstance(props, dict) and SLUG_KEYS & props.keys() and SLUG_ARGUMENT_KEYS & props.keys():
+            return True
+        return any(_runs_slugs(v) for v in schema.values())
+    if isinstance(schema, list):
+        return any(_runs_slugs(v) for v in schema)
+    return False
+
+
+def _slugs_in(arguments: Any, out: list[str]) -> list[str]:
+    if isinstance(arguments, dict):
+        for key, value in arguments.items():
+            if key in SLUG_KEYS and isinstance(value, str):
+                out.append(value)
+            else:
+                _slugs_in(value, out)
+    elif isinstance(arguments, list):
+        for value in arguments:
+            _slugs_in(value, out)
+    return out
+
+
+def _slug_call_risk(base: Risk, arguments: dict, ctx: Any) -> Risk | None:
+    """Per-call risk of a tool that runs other tools: ``read`` when every slug it runs is a look-up, else the
+    riskiest slug and never below the tool's own risk. No slug found: the tool's own risk."""
+    slugs = _slugs_in(arguments, [])
+    if not slugs:
+        return None
+    risk = max(slug_risk(s) for s in slugs)
+    return Risk.read if risk == Risk.read else max(risk, base)
+
+
+def _result_to_json(result: Any) -> dict:
+    texts: list[str] = []
+    for block in getattr(result, "content", None) or []:
+        kind = getattr(block, "type", "")
+        if kind == "text":
+            texts.append(block.text)
+        elif kind == "resource":
+            res = getattr(block, "resource", None)
+            texts.append(getattr(res, "text", None) or f"[resource {getattr(res, 'uri', '')}]")
+        elif kind == "resource_link":
+            texts.append(f"[link {getattr(block, 'uri', '')}]")
+        else:
+            texts.append(f"[{kind or 'content'} omitted]")
+    text = "\n".join(texts)
+    if getattr(result, "is_error", False):
+        return {"error": text or "The MCP tool reported an error."}
+    out: dict[str, Any] = {"content": text}
+    structured = getattr(result, "structured_content", None)
+    if structured and not _repeats(structured, text):
+        out["structured"] = structured
+    return out
+
+
+def _repeats(structured: Any, text: str) -> bool:
+    """True when a result's structured content only repeats its text (a server returning a plain string gives
+    ``{"result": text}``), so the model doesn't read the same result twice (#264)."""
+    same = [structured]
+    if isinstance(structured, dict) and list(structured) == ["result"]:
+        same.append(structured["result"])
+    if text in same:
+        return True
+    try:
+        return json.loads(text) in same
+    except ValueError:
+        return False
+
+
+class MCPManager:
+    def __init__(self, mgr: IntegrationManager):
+        self.mgr = mgr
+        self.servers: dict[str, ServerConn] = {}
+        self._flows: dict[str, SignInFlow] = {}  # OAuth state -> browser sign-in in progress
+        self.http_transport: Any = None  # tests: an httpx2 transport for remote servers
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._baseline: set[str] = set()  # servers trusted as they are the first time they connect (#146)
+        self._announced: set[tuple[str, str, str]] = set()  # (server, tool, hash) the user was told about
+
+    @property
+    def app(self) -> Any:
+        return self.mgr.app
+
+    # ------------------------------------------------------------------ lifecycle
+    async def start(self) -> None:
+        await self._load_baseline()
+        for name, spec in dict(self.app.config.integrations.mcp_servers).items():
+            spec_dict = dict(spec or {})
+            if spec_dict.get("transport") == "http" and spec_dict.get("url"):
+                migrate_server_credentials(name, spec_dict.get("url"))
+            self._launch(name, spec_dict)
+
+    async def stop(self) -> None:
+        for conn in list(self.servers.values()):
+            self._cancel_sign_in(conn)
+        await asyncio.gather(*(self._shutdown(c) for c in list(self.servers.values())), return_exceptions=True)
+
+    def connected_plugin_ids(self) -> set[str]:
+        return {plugin_id_for(c.name) for c in self.servers.values() if c.status == "connected"}
+
+    # ------------------------------------------------------------------ public operations
+    def list(self) -> list[dict]:
+        return [self.describe(c) for c in self.servers.values()]
+
+    def describe(self, conn: ServerConn) -> dict:
+        spec = conn.spec
+        env_keys = sorted(set(spec.get("env_keys") or []) | set((spec.get("env") or {}).keys()))
+        auth = _auth_of(spec)
+        return {
+            "name": conn.name,
+            "transport": spec.get("transport", "stdio"),
+            "command": spec.get("command"),
+            "args": list(spec.get("args") or []),
+            "url": spec.get("url"),
+            "env_keys": env_keys,
+            "auth": auth,
+            "header_keys": sorted(spec.get("header_keys") or []),
+            "missing_values": self._missing_values(conn.name, spec),
+            "signed_in": auth == "oauth" and KeychainTokenStorage(conn.name, url=conn.spec.get("url")).has_tokens(),
+            "signing_in": conn.signin is not None,
+            "enabled": bool(spec.get("enabled", True)),
+            "access": self.mgr.access(plugin_id_for(conn.name)),
+            "status": conn.status,
+            "tools": list(conn.tools),
+            "review": conn.review,
+            "error": conn.error,
+        }
+
+    async def add(self, name: str, spec: dict, *, wait_s: float = 15.0) -> dict:
+        name = name.strip()
+        if not name:
+            raise ValueError("A server name is required.")
+        if spec.get("access") not in (None, "read", "read_write"):
+            raise ValueError("access must be 'read' or 'read_write'.")
+        transport = spec.get("transport", "stdio")
+        if transport not in {"stdio", "http"}:
+            raise ValueError("transport must be 'stdio' or 'http'.")
+        if transport == "stdio" and not spec.get("command"):
+            raise ValueError("A command is required for stdio servers.")
+        if transport == "http" and not spec.get("url"):
+            raise ValueError("A URL is required for http servers.")
+        pid = plugin_id_for(name)
+        for other in self.servers:
+            if other != name and plugin_id_for(other) == pid:
+                raise ValueError(f"'{name}' is too similar to the existing server '{other}'.")
+        headers = {str(k).strip(): str(v).strip() for k, v in (spec.get("headers") or {}).items() if str(k).strip()}
+        auth = spec.get("auth") or ("headers" if headers else "none")
+        if auth not in AUTH_MODES:
+            raise ValueError("auth must be 'none', 'headers' or 'oauth'.")
+        if transport == "stdio" and (headers or auth != "none"):
+            raise ValueError("Headers and sign-in are only for remote (http) servers.")
+        if auth == "headers" and not headers:
+            raise ValueError("Add at least one header, or pick another way to sign in.")
+        for key, value in headers.items():
+            if not HEADER_NAME.match(key):
+                raise ValueError(f"'{key}' isn't a valid header name.")
+            if not value or any(c in value for c in "\r\n"):
+                raise ValueError(f"Enter a single-line value for the header '{key}'.")
+        async with self._server_lock(name):
+            env = {str(k): str(v) for k, v in (spec.get("env") or {}).items()}
+            if env and not store_secret_json(f"mcp:{name}", env):
+                raise ValueError("The system keychain is unavailable, so environment values can't be stored safely.")
+            if headers and not save_json(headers_secret(name), headers):
+                raise ValueError("The system keychain is unavailable, so header values can't be stored safely.")
+            if not headers:
+                delete_json(headers_secret(name))
+            stored = {
+                "transport": transport,
+                "command": spec.get("command"),
+                "args": [str(a) for a in spec.get("args") or []],
+                "url": spec.get("url"),
+                "env_keys": sorted(env.keys()),
+                "auth": auth,
+                "header_keys": sorted(headers.keys()),
+                "enabled": bool(spec.get("enabled", True)),
+            }
+            previous = self.app.config.integrations.mcp_servers.get(name)
+            prev_url = previous.get("url") if isinstance(previous, dict) else None
+            changed_here = previous is not None and (
+                previous.get("url") != stored["url"] or previous.get("transport", "stdio") != transport)
+            if previous is None or changed_here or previous.get("command") != stored["command"] or [
+                    str(a) for a in previous.get("args") or []] != stored["args"]:
+                await self._forget_reviews(name)  # another program or address: its tools are checked afresh
+            # A sign-in belongs to one server address. The keychain is shared with other setups on this computer,
+            # so only clear one saved for another address, never one another setup made for this same server.
+            for secret in stale_sign_in(
+                name,
+                stored["url"] if transport == "http" else None,
+                changed_here=changed_here,
+                previous_url=prev_url if changed_here else None,
+            ):
+                delete_json(secret)
+            if transport == "http" and stored.get("url"):
+                migrate_server_credentials(name, stored["url"])
+            if name in self.servers:
+                old = self.servers.pop(name)
+                self._cancel_sign_in(old)
+                await self._shutdown(old)
+            cfg = self.app.config
+            cfg.integrations.mcp_servers = {**cfg.integrations.mcp_servers, name: stored}
+            if spec.get("access") is not None:  # saved before the server starts, so it never has more than chosen
+                self.mgr.save_access(pid, str(spec["access"]))
+            self.app.save_config()
+            conn = self._launch(name, stored)
+        if stored["enabled"] and wait_s > 0:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(conn.ready.wait(), wait_s)
+        return self.describe(conn)
+
+    async def import_server(self, name: str, spec: dict) -> dict:
+        """Add a server brought over from another assistant, turned off and without any secret values: only the
+        names of its headers and environment settings are kept, and an OAuth server signs in again when turned on."""
+        name = name.strip()
+        transport = spec.get("transport", "stdio")
+        if not name or transport not in {"stdio", "http"}:
+            raise ValueError("This server can't be added.")
+        if (transport == "stdio" and not spec.get("command")) or (transport == "http" and not spec.get("url")):
+            raise ValueError("It has no address or command.")
+        pid = plugin_id_for(name)
+        if any(plugin_id_for(other) == pid for other in [*self.servers, *self.app.config.integrations.mcp_servers]):
+            raise ValueError("Sentient already has a server with this name.")
+        header_keys = sorted(str(k) for k in spec.get("header_keys") or []) if transport == "http" else []
+        auth = spec.get("auth") if transport == "http" and spec.get("auth") in AUTH_MODES else "none"
+        if auth == "headers" and not header_keys:
+            auth = "none"
+        stored = {
+            "transport": transport,
+            "command": spec.get("command") if transport == "stdio" else None,
+            "args": [str(a) for a in spec.get("args") or []] if transport == "stdio" else [],
+            "url": spec.get("url") if transport == "http" else None,
+            "env_keys": sorted(str(k) for k in spec.get("env_keys") or []) if transport == "stdio" else [],
+            "auth": auth,
+            "header_keys": header_keys,
+            "enabled": False,
+        }
+        await self._forget_reviews(name)
+        cfg = self.app.config
+        cfg.integrations.mcp_servers = {**cfg.integrations.mcp_servers, name: stored}
+        self.app.save_config()
+        return self.describe(self._launch(name, stored))
+
+    @staticmethod
+    def _missing_values(name: str, spec: dict) -> list[str]:
+        """Header and environment names this server lists without a value (an imported server, for example)."""
+        if spec.get("transport", "stdio") == "http":
+            have = load_json(headers_secret(name)) or {}
+            return sorted(k for k in spec.get("header_keys") or [] if not str(have.get(k) or "").strip())
+        have = {**(spec.get("env") or {}), **(load_secret_json(f"mcp:{name}") or {})}
+        return sorted(k for k in spec.get("env_keys") or [] if not str(have.get(k) or "").strip())
+
+    def _server_lock(self, name: str) -> asyncio.Lock:
+        """One change at a time per server, so overlapping requests can't leave a connection untracked."""
+        return self._locks.setdefault(name, asyncio.Lock())
+
+    async def _relaunch(self, name: str, stored: dict) -> ServerConn:
+        old = self.servers.pop(name, None)
+        if old is not None:
+            self._cancel_sign_in(old)
+            await self._shutdown(old)
+        return self._launch(name, stored)
+
+    async def set_values(self, name: str, values: dict, *, enable: bool = False, wait_s: float = 15.0) -> dict:
+        """Fill in the header or environment values a server lists by name (the "Add values" form). Values go to the
+        keychain, never to config; a blank value keeps the saved one. Then the server reconnects (and is turned on
+        with ``enable``)."""
+        async with self._server_lock(name):
+            cfg = self.app.config
+            spec = cfg.integrations.mcp_servers.get(name)
+            if spec is None:
+                raise KeyError(name)
+            http = spec.get("transport", "stdio") == "http"
+            allowed = set(spec.get("header_keys" if http else "env_keys") or [])
+            given = {str(k).strip(): str(v).strip() for k, v in (values or {}).items() if str(v).strip()}
+            for key, value in given.items():
+                if key not in allowed:
+                    raise ValueError(f"'{key}' isn't one of this server's {'headers' if http else 'settings'}.")
+                if len(value.splitlines()) > 1:
+                    raise ValueError(f"Enter a single-line value for '{key}'.")
+            if http and given and not _protected_url(str(spec.get("url") or "")):
+                raise ValueError("This server's address starts with http://, so these values would be sent unprotected. "
+                                 "Change it to an https:// address first.")
+            if given:
+                secret = headers_secret(name) if http else f"mcp:{name}"
+                current = (load_json(secret) if http else load_secret_json(secret)) or {}
+                merged = {**{k: v for k, v in current.items() if k in allowed}, **given}
+                if not (save_json(secret, merged) if http else store_secret_json(secret, merged)):
+                    raise ValueError("The system keychain is unavailable, so these values can't be stored safely.")
+            stored = dict(spec)
+            if http and given and _auth_of(stored) == "none":
+                stored["auth"] = "headers"
+            if enable and not self._missing_values(name, stored):  # turned on only once nothing is missing
+                stored["enabled"] = True
+            if stored != spec:
+                cfg.integrations.mcp_servers = {**cfg.integrations.mcp_servers, name: stored}
+                self.app.save_config()
+            conn = await self._relaunch(name, stored)
+        if stored.get("enabled", True) and wait_s > 0:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(conn.ready.wait(), wait_s)
+        return self.describe(conn)
+
+    async def set_enabled(self, name: str, enabled: bool) -> dict:
+        """Turn a server on or off without changing anything else."""
+        async with self._server_lock(name):
+            cfg = self.app.config
+            spec = cfg.integrations.mcp_servers.get(name)
+            if spec is None:
+                raise KeyError(name)
+            stored = {**spec, "enabled": bool(enabled)}
+            cfg.integrations.mcp_servers = {**cfg.integrations.mcp_servers, name: stored}
+            self.app.save_config()
+            return self.describe(await self._relaunch(name, stored))
+
+    async def set_access(self, name: str, access: str) -> dict:
+        """Set a server to Read only (``read``) or Read and write (``read_write``). It keeps running: the change
+        applies to the next tool list and the next call (#141)."""
+        async with self._server_lock(name):
+            if name not in self.app.config.integrations.mcp_servers:
+                raise KeyError(name)
+            try:
+                self.mgr.save_access(plugin_id_for(name), access)
+            except IntegrationError as exc:
+                raise ValueError(str(exc)) from exc
+            conn = self.servers.get(name)
+            return self.describe(conn) if conn is not None else self.describe(ServerConn(name, dict(
+                self.app.config.integrations.mcp_servers[name])))
+
+    async def remove(self, name: str) -> bool:
+        async with self._server_lock(name):
+            conn = self.servers.pop(name, None)
+            if conn is not None:
+                self._cancel_sign_in(conn)
+                await self._shutdown(conn)
+            cfg = self.app.config
+            existed = name in cfg.integrations.mcp_servers
+            spec = cfg.integrations.mcp_servers.get(name) or (conn.spec if conn else {})
+            url = spec.get("url") if spec else None
+            if existed:
+                cfg.integrations.mcp_servers = {k: v for k, v in cfg.integrations.mcp_servers.items() if k != name}
+                cfg.integrations.read_only = [p for p in cfg.integrations.read_only if p != plugin_id_for(name)]
+                self.app.save_config()
+            delete_secret(f"mcp:{name}")
+            forget_server(name, url=url)
+            await self._forget_reviews(name)
+            return existed or conn is not None
+
+    # ------------------------------------------------------------------ safety check of tools (#146)
+    async def review_tools(self, name: str, decisions: dict[str, str]) -> dict:
+        """Approve or decline tools of a connected server: ``{tool name on the server: "approve"|"decline"}``. The
+        decision is for what the tool says right now (its hash); tools not named keep their state. Approved tools are
+        offered at once, declined ones are taken away."""
+        async with self._server_lock(name):
+            conn = self.servers.get(name)
+            if conn is None or name not in self.app.config.integrations.mcp_servers:
+                raise KeyError(name)
+            listed = {t.name: t for t in conn.listed}
+            if not listed:
+                raise ValueError("Connect this server first, so Sentient can see its tools.")
+            for tool, decision in decisions.items():
+                if tool not in listed:
+                    raise ValueError(f"'{tool}' isn't one of this server's tools.")
+                if decision not in {"approve", "decline"}:
+                    raise ValueError("Each answer must be 'approve' or 'decline'.")
+            ts = now_iso()
+            for tool, decision in decisions.items():
+                t = listed[tool]
+                await self.app.store.execute(
+                    "INSERT INTO mcp_tool_reviews(server, tool, hash, decision, description, decided_at) VALUES(?,?,?,?,?,?)"
+                    " ON CONFLICT(server, tool) DO UPDATE SET hash = excluded.hash, decision = excluded.decision,"
+                    " description = excluded.description, decided_at = excluded.decided_at, alerted_hash = NULL",
+                    (name, tool, mcp_vet.tool_hash(t), "approved" if decision == "approve" else "declined",
+                     (t.description or "")[:4000], ts),
+                )
+            if conn.status == "connected" and conn.client is not None:
+                self._register(conn, conn.listed, await self._review(conn, conn.listed))
+            else:
+                await self._review(conn, conn.listed)
+            self.app.bus.publish("mcp.review", {"server": name, "needed": bool(conn.review and conn.review["needed"])})
+            return self.describe(conn)
+
+    async def _load_baseline(self) -> None:
+        store = self.app.store
+        raw = await store.get_meta(BASELINE_KEY)
+        if raw is None:  # the first start with reviews: what is configured now was the user's choice already
+            self._baseline = set(self.app.config.integrations.mcp_servers)
+            await store.set_meta(BASELINE_KEY, json.dumps(sorted(self._baseline)))
+            return
+        try:
+            self._baseline = {str(n) for n in json.loads(raw)}
+        except ValueError:
+            self._baseline = set()
+
+    async def _drop_baseline(self, name: str) -> None:
+        if name in self._baseline:
+            self._baseline.discard(name)
+            await self.app.store.set_meta(BASELINE_KEY, json.dumps(sorted(self._baseline)))
+
+    async def _forget_reviews(self, name: str) -> None:
+        await self._drop_baseline(name)
+        await self.app.store.execute("DELETE FROM mcp_tool_reviews WHERE server = ?", (name,))
+        self._announced = {a for a in self._announced if a[0] != name}
+
+    def _builtin_names(self) -> set[str]:
+        return {t.name for t in self.app.registry.tools(include_hidden=True) if not str(t.plugin).startswith("mcp_")}
+
+    async def _review(self, conn: ServerConn, mcp_tools: list) -> set[str]:
+        """Check and hash each listed tool, compare with what the user approved, and return the names to offer.
+        Sets ``conn.review`` and tells the user about new and changed tools once."""
+        store = self.app.store
+        name = conn.name
+        rows = {r["tool"]: dict(r) for r in await store.fetchall(
+            "SELECT * FROM mcp_tool_reviews WHERE server = ?", (name,))}
+        unique: dict[str, Any] = {}
+        for t in mcp_tools:
+            unique.setdefault(t.name, t)
+        if not rows and unique and name in self._baseline:  # an empty listing keeps the trust for later
+            ts = now_iso()  # trusted before reviews existed: what it offers now is what the user had approved
+            for t in unique.values():
+                await store.execute(
+                    "INSERT OR IGNORE INTO mcp_tool_reviews(server, tool, hash, decision, description, decided_at)"
+                    " VALUES(?,?,?,?,?,?)", (name, t.name, mcp_vet.tool_hash(t), "approved", (t.description or "")[:4000], ts))
+            await self._drop_baseline(name)
+            rows = {r["tool"]: dict(r) for r in await store.fetchall(
+                "SELECT * FROM mcp_tool_reviews WHERE server = ?", (name,))}
+        builtin = self._builtin_names()
+        items: list[dict] = []
+        allowed: set[str] = set()
+        new: list[str] = []
+        changed: list[str] = []
+        for t in unique.values():
+            digest = mcp_vet.tool_hash(t)
+            check = mcp_vet.vet_tool(t, builtin, sanitize=sanitize)
+            row = rows.get(t.name)
+            if row is not None and row["hash"] == digest:
+                status = row["decision"]
+            elif row is not None:
+                status = "changed"
+                if row.get("alerted_hash") != digest:
+                    changed.append(t.name)
+                    await store.execute("UPDATE mcp_tool_reviews SET alerted_hash = ? WHERE server = ? AND tool = ?",
+                                        (digest, name, t.name))
+            else:
+                status = "new"
+                if (name, t.name, digest) not in self._announced:
+                    new.append(t.name)
+            self._announced.add((name, t.name, digest))
+            if status == "approved":
+                allowed.add(t.name)
+            description = t.description or getattr(t, "title", None) or t.name
+            item = {
+                "name": mcp_tool_name(name, t.name),
+                "mcp_name": t.name,
+                "description": mcp_vet.visible(description)[:1024],
+                "risk": _risk_for(t).name,
+                "per_call": _runs_slugs(dict(getattr(t, "input_schema", None) or {})),
+                "status": status,
+                "level": check["level"],
+                "findings": check["findings"],
+                "suggested": "decline" if check["level"] == "high" else "approve",
+            }
+            if status == "changed":
+                item["previous_description"] = mcp_vet.visible(row.get("description") or "")[:1024]
+                item["previous_decision"] = row["decision"]
+            items.append(item)
+        waiting = [i for i in items if i["status"] in {"new", "changed"}]
+        levels = [i["level"] for i in items]
+        conn.review = {
+            "needed": bool(waiting),
+            "reason": "changed" if any(i["status"] == "changed" for i in waiting) else ("new" if waiting else None),
+            "verdict": "high" if "high" in levels else ("check" if "check" in levels else "clear"),
+            "tools": items,
+            "scanner": mcp_vet.SCANNER_VERSION,
+        }
+        if changed:
+            await self._tell(name, "changed", changed)
+        elif new:
+            await self._tell(name, "new", new)
+        return allowed
+
+    async def _tell(self, server: str, reason: str, tools: list[str]) -> None:
+        shown = ", ".join(tools[:5]) + (f" and {len(tools) - 5} more" if len(tools) > 5 else "")
+        if reason == "changed":
+            title = f"{server} changed its tools"
+            message = (f"{server} changed what {len(tools)} tool{'s say' if len(tools) != 1 else ' says'} about "
+                       f"{'themselves' if len(tools) != 1 else 'itself'} since you approved {'them' if len(tools) != 1 else 'it'}"
+                       f" ({shown}). Sentient stopped offering {'them' if len(tools) != 1 else 'it'} until you check "
+                       "the change in Integrations.")
+        else:
+            title = f"Check the tools from {server}"
+            message = (f"{server} offers {len(tools)} new tool{'s' if len(tools) != 1 else ''} ({shown}). Sentient won't "
+                       "use them until you look at the safety check and approve them in Integrations.")
+        payload = {"mcp_review": {"server": server, "reason": reason, "tools": tools}}
+        self.app.bus.publish("mcp.review", {"server": server, "reason": reason, "tools": tools, "needed": True})
+        try:
+            await self.app.notify("info", message, title=title, payload=payload)
+        except Exception:  # a notification must never break a connection
+            log.exception("could not tell the user about %s's tools", server)
+
+    async def test(self, name: str) -> dict:
+        conn = self.servers.get(name)
+        if conn is None:
+            raise KeyError(name)
+        if conn.status == "connected" and conn.client is not None:
+            try:
+                tools = await self._list_tools(conn.client)
+                return {"ok": True, "tools": [t.name for t in tools]}
+            except Exception as exc:
+                conn.broken.set()
+                return {"ok": False, "tools": [], "error": _err(exc)}
+        probe = Probe()
+        try:
+            async with asyncio.timeout(CONNECT_TIMEOUT_S):
+                async with self._client(conn.name, conn.spec, probe=probe) as client:
+                    tools = await self._list_tools(client)
+            if conn.status in {"error", "disconnected", "needs_sign_in"} and conn.spec.get("enabled", True):
+                conn.broken.set()  # wake the runner so it reconnects now
+            return {"ok": True, "tools": [t.name for t in tools]}
+        except Exception as exc:
+            if probe.unauthorized or _has(exc, NeedsSignIn):
+                return {"ok": False, "tools": [], "error": SIGN_IN_MESSAGES[_auth_of(conn.spec)]}
+            return {"ok": False, "tools": [], "error": _err(exc)}
+
+    # ------------------------------------------------------------------ sign-in (MCP authorization spec)
+    async def sign_in(self, name: str) -> dict:
+        """Start a browser sign-in. Returns ``{auth_url, state}``; the loopback callback finishes it."""
+        conn = self.servers.get(name)
+        if conn is None:
+            raise KeyError(name)
+        if conn.spec.get("transport", "stdio") != "http":
+            raise ValueError("Only remote (http) servers can sign in.")
+        self._cancel_sign_in(conn)
+        listener = self.mgr.listener
+        await listener.start(self.app.config.integrations.oauth_redirect_port)
+        redirect_uri = listener.redirect_uri()
+        store = KeychainTokenStorage(name, fresh=True, url=conn.spec.get("url"))
+        registered = await store.get_client_info()
+        if registered is not None and redirect_uri not in [str(u) for u in registered.redirect_uris or []]:
+            url = conn.spec.get("url")
+            delete_json(client_secret(name, url))  # registered for another port: register again
+            if url:
+                leg_key = client_secret(name, None)
+                leg = load_json(leg_key)
+                if isinstance(leg, dict):
+                    saved = leg.get(SERVER_URL_KEY)
+                    if saved is not None and canonical_url(saved) == canonical_url(url):
+                        delete_json(leg_key)
+        loop = asyncio.get_running_loop()
+        flow = SignInFlow(server=name, url=loop.create_future(), code=loop.create_future())
+        conn.signin = flow
+        flow.task = asyncio.create_task(self._sign_in_run(conn, flow, store, redirect_uri), name=f"mcp-sign-in:{name}")
+        flow.task.add_done_callback(_log_sign_in_result)
+        await asyncio.wait({flow.url, flow.task}, timeout=CONNECT_TIMEOUT_S, return_when=asyncio.FIRST_COMPLETED)
+        if flow.url.done():
+            return {"auth_url": flow.url.result(), "state": flow.state}
+        self._cancel_sign_in(conn)
+        if flow.task.done() and not flow.task.cancelled() and flow.task.exception() is not None:
+            raise ValueError(_sign_in_error(flow.task.exception()))
+        raise ValueError("The server didn't answer in time. Try again in a moment.")
+
+    async def sign_out(self, name: str) -> dict:
+        conn = self.servers.get(name)
+        if conn is None:
+            raise KeyError(name)
+        self._cancel_sign_in(conn)
+        url = conn.spec.get("url")
+        tok_key = tokens_secret(name, url)
+        delete_json(tok_key)
+        if load_json(tok_key) is not None:
+            raise ValueError(f"Could not remove credentials for '{name}' from keychain during sign-out.")
+        if url:
+            canon = canonical_url(url)
+            leg_key = tokens_secret(name, None)
+            leg = load_json(leg_key)
+            if isinstance(leg, dict):
+                saved = leg.get(SERVER_URL_KEY)
+                if saved is not None and canonical_url(saved) == canon:
+                    delete_json(leg_key)
+                    if load_json(leg_key) is not None:
+                        raise ValueError(f"Could not remove legacy credentials for '{name}' from keychain during sign-out.")
+        if _auth_of(conn.spec) == "oauth" and conn.spec.get("enabled", True):
+            await self._shutdown(self.servers.pop(name))
+            conn = self._launch(name, conn.spec)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(conn.ready.wait(), 5)
+        return self.describe(conn)
+
+    def owns_state(self, state: str) -> bool:
+        return bool(state) and state in self._flows
+
+    async def oauth_callback(self, params: dict[str, str]) -> tuple[bool, str]:
+        """The browser came back to the loopback listener with this server's state."""
+        flow = self._flows.get(params.get("state", ""))
+        if flow is None or time.time() - flow.created > SIGN_IN_TTL_S:
+            return False, "This sign-in link has expired."
+        if flow.code.done():
+            return False, "This sign-in link was already used."
+        if params.get("error") or not params.get("code"):
+            reason = "You cancelled the sign-in." if params.get("error") == "access_denied" else (
+                f"The server reported: {params.get('error_description') or params.get('error') or 'no sign-in code'}.")
+            flow.code.set_exception(SignInFailed(reason))
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(asyncio.shield(flow.task), CONNECT_TIMEOUT_S)  # type: ignore[arg-type]
+            return False, reason
+        from mcp.shared.auth import AuthorizationCodeResult
+
+        flow.code.set_result(AuthorizationCodeResult(code=params["code"], state=params.get("state"),
+                                                     iss=params.get("iss")))
+        try:
+            await asyncio.wait_for(asyncio.shield(flow.task), CONNECT_TIMEOUT_S)  # type: ignore[arg-type]
+        except TimeoutError:
+            return True, f"You're signed in. Sentient is still connecting to {flow.server}."
+        except Exception as exc:
+            return False, _sign_in_error(exc)
+        return True, f"{flow.server} is connected."
+
+    async def _sign_in_run(self, conn: ServerConn, flow: SignInFlow, store: KeychainTokenStorage,
+                           redirect_uri: str) -> None:
+        async def open_browser(url: str) -> None:
+            flow.state = (parse_qs(urlsplit(url).query).get("state") or [""])[0]
+            self._flows[flow.state] = flow
+            if not flow.url.done():
+                flow.url.set_result(url)
+
+        async def wait_for_code() -> Any:
+            return await flow.code
+
+        provider = SentientOAuthProvider(conn.spec["url"], client_metadata(redirect_uri), store, open_browser,
+                                         wait_for_code)
+        try:
+            async with asyncio.timeout(SIGN_IN_TTL_S):
+                async with self._client(conn.name, conn.spec, auth=provider, read_timeout=SIGN_IN_TTL_S) as client:
+                    await self._list_tools(client)
+        except Exception as exc:
+            if flow.code.done() and conn.status != "connected":
+                conn.error = _sign_in_error(exc)
+            raise
+        finally:
+            self._flows.pop(flow.state, None)
+            if conn.signin is flow:
+                conn.signin = None
+        if not store.saved:
+            raise SignInFailed("This server didn't ask for a sign-in, so there is nothing to do.")
+        if _auth_of(conn.spec) != "oauth":
+            conn.spec = {**conn.spec, "auth": "oauth"}
+            cfg = self.app.config
+            if conn.name in cfg.integrations.mcp_servers:
+                cfg.integrations.mcp_servers = {**cfg.integrations.mcp_servers, conn.name: conn.spec}
+                self.app.save_config()
+        conn.error = None
+        conn.refresh_tried = False
+        conn.broken.set()  # reconnect now with the new sign-in
+
+    def _cancel_sign_in(self, conn: ServerConn) -> None:
+        flow, conn.signin = conn.signin, None
+        if flow is None:
+            return
+        self._flows.pop(flow.state, None)
+        if flow.task is not None and not flow.task.done():
+            flow.task.cancel()
+
+    # ------------------------------------------------------------------ internals
+    def _launch(self, name: str, spec: dict) -> ServerConn:
+        conn = ServerConn(name=name, spec=spec)
+        self.servers[name] = conn
+        if not spec.get("enabled", True):
+            conn.status = "disabled"
+            conn.ready.set()
+            return conn
+        conn.task = asyncio.create_task(self._run(conn), name=f"mcp:{name}")
+        return conn
+
+    async def _shutdown(self, conn: ServerConn) -> None:
+        conn.stop.set()
+        conn.broken.set()
+        if conn.task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(conn.task), 10)
+            except Exception:
+                conn.task.cancel()
+                with contextlib.suppress(BaseException):
+                    await conn.task
+        self._unregister(conn)
+        conn.status = "disconnected"
+
+    @contextlib.asynccontextmanager
+    async def _client(self, name: str, spec: dict, *, auth: Any = None, probe: Probe | None = None,
+                      read_timeout: float | None = None):
+        from mcp import Client, StdioServerParameters
+
+        timeout = float(read_timeout or self.app.config.integrations.mcp_timeout_s)
+        if spec.get("transport", "stdio") == "http":
+            import httpx2
+            from mcp.client.streamable_http import streamable_http_client
+
+            url = spec["url"]
+            if auth is None and _auth_of(spec) == "oauth":
+                auth = self._stored_sign_in(name, url)
+            endpoint = httpx2.URL(url)
+
+            async def on_response(response: Any) -> None:
+                seen = response.request.url
+                if (response.status_code == 401 and probe is not None and seen.host == endpoint.host
+                        and seen.path.rstrip("/") == endpoint.path.rstrip("/")):
+                    probe.unauthorized = True
+
+            headers = {str(k): str(v) for k, v in (load_json(headers_secret(name)) or {}).items()}
+            async with (
+                httpx2.AsyncClient(
+                    timeout=httpx2.Timeout(30.0, read=300.0), headers=headers, auth=auth,
+                    transport=self.http_transport, event_hooks={"response": [on_response]},
+                ) as http,
+                Client(streamable_http_client(url, http_client=http), read_timeout_seconds=timeout) as client,
+            ):
+                yield client
+            return
+        env = dict(spec.get("env") or {})
+        env.update(load_secret_json(f"mcp:{name}") or {})
+        params = StdioServerParameters(command=spec["command"], args=list(spec.get("args") or []), env=env or None)
+        async with Client(params, read_timeout_seconds=timeout) as client:
+            yield client
+
+    def _stored_sign_in(self, name: str, url: str) -> SentientOAuthProvider:
+        """OAuth for background connections: uses and refreshes the stored sign-in, never opens a browser."""
+        store = KeychainTokenStorage(name, url=url)
+        if not store.has_tokens():
+            raise NeedsSignIn(name)
+
+        async def no_browser(_url: str) -> None:
+            raise NeedsSignIn(name)
+
+        async def no_code() -> Any:
+            raise NeedsSignIn(name)
+
+        registered = load_json(client_secret(name, url))
+        if not registered and url:
+            leg_cli = load_json(client_secret(name, None))
+            if isinstance(leg_cli, dict):
+                saved_cli = leg_cli.get(SERVER_URL_KEY)
+                if saved_cli is not None and canonical_url(saved_cli) == canonical_url(url):
+                    registered = leg_cli
+        registered = registered or {}
+        redirect = (registered.get("redirect_uris") or ["http://127.0.0.1/oauth/callback"])[0]
+        return SentientOAuthProvider(url, client_metadata(redirect), store, no_browser, no_code,
+                                     discovery_transport=self.http_transport)
+
+    @staticmethod
+    async def _list_tools(client: Any) -> list:
+        tools: list = []
+        cursor = None
+        for _ in range(50):
+            res = await client.list_tools(cursor=cursor)
+            tools.extend(res.tools)
+            cursor = getattr(res, "next_cursor", None)
+            if not cursor:
+                break
+        return tools
+
+    async def _run(self, conn: ServerConn) -> None:
+        backoff = MIN_BACKOFF_S
+        while not conn.stop.is_set():
+            conn.status, conn.error = "connecting", None
+            conn.broken.clear()
+            probe = Probe()
+            retry_now = False
+            try:
+                async with self._client(conn.name, conn.spec, probe=probe) as client:
+                    tools = await asyncio.wait_for(self._list_tools(client), CONNECT_TIMEOUT_S)
+                    conn.client = client
+                    conn.listed = list(tools)
+                    try:
+                        allowed = await self._review(conn, tools)
+                    except Exception:  # the check couldn't run: offer nothing rather than unchecked tools
+                        log.exception("mcp server %s: the safety check failed", conn.name)
+                        allowed = set()
+                    self._register(conn, tools, allowed)
+                    conn.status = "connected"
+                    conn.refresh_tried = False
+                    conn.ready.set()
+                    backoff = MIN_BACKOFF_S
+                    log.info("mcp server %s connected with %d tools", conn.name, len(tools))
+                    await conn.broken.wait()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                auth = _auth_of(conn.spec)
+                if probe.unauthorized or _has(exc, NeedsSignIn):
+                    if auth == "oauth" and not conn.refresh_tried and KeychainTokenStorage(conn.name, url=conn.spec.get("url")).mark_expired():
+                        conn.refresh_tried = True  # the token may have died early: refresh once before asking
+                        retry_now = True
+                    conn.status, conn.error = "needs_sign_in", SIGN_IN_MESSAGES[auth]
+                    log.info("mcp server %s needs a sign-in", conn.name)
+                else:
+                    conn.status, conn.error = "error", _err(exc)
+                    log.warning("mcp server %s failed: %s", conn.name, conn.error)
+            finally:
+                conn.client = None
+                self._unregister(conn)
+                if not retry_now:
+                    conn.ready.set()
+            if conn.stop.is_set():
+                break
+            if conn.status == "connected":
+                conn.status = "connecting"
+            if retry_now:
+                continue
+            conn.broken.clear()  # set again by test(), a finished sign-in or shutdown to wake this loop early
+            wait = MAX_BACKOFF_S if conn.status == "needs_sign_in" else backoff
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(conn.broken.wait(), wait)
+            backoff = min(backoff * 2, MAX_BACKOFF_S)
+        conn.status = conn.status if conn.status in {"error", "needs_sign_in"} else "disconnected"
+
+    def _register(self, conn: ServerConn, mcp_tools: list, allowed: set[str]) -> None:
+        """Register the tools named in ``allowed`` (the ones the user approved as they are now)."""
+        self._unregister(conn)
+        tools: list[JsonSchemaTool] = []
+        described: list[dict] = []
+        used: set[str] = set()
+        pid = plugin_id_for(conn.name)
+        for t in mcp_tools:
+            name = mcp_tool_name(conn.name, t.name)
+            if name in used or t.name not in allowed:
+                continue
+            used.add(name)
+            risk = _risk_for(t)
+            jt = JsonSchemaTool(
+                name=name,
+                description=(t.description or getattr(t, "title", None) or t.name)[:1024],
+                fn=self._caller(conn, t.name),
+                input_schema=dict(getattr(t, "input_schema", None) or {}),
+                risk=risk,
+                plugin=pid,
+            )
+            # another program's tools: results are outside content, and any change may send data out (ADR 0018)
+            jt.untrusted_output = True
+            jt.exfiltrates = risk != Risk.read
+            jt.shorten_fn = shortener_for(t.name)  # known long results keep their useful part (#264)
+            if _runs_slugs(jt.input_schema):  # runs other tools: judged per call, whatever its hints say (#141)
+                jt.risk_fn = functools.partial(_slug_call_risk, risk)
+                jt.exfiltrates = True
+            tools.append(jt)
+            described.append({"name": name, "mcp_name": t.name, "description": jt.description, "risk": risk.name,
+                              "per_call": jt.risk_fn is not None})
+        plugin = MCPServerPlugin(conn.name, tools)
+        reg = self.app.registry
+        plugin.tools = [t for t in tools if not reg.has_tool(t.name)]
+        try:
+            reg.register(plugin)
+        except ValueError as exc:
+            log.warning("mcp server %s tools not registered: %s", conn.name, exc)
+            return
+        conn.plugin = plugin
+        conn.tools = [d for d in described if any(t.name == d["name"] for t in plugin.tools)]
+
+    def _unregister(self, conn: ServerConn) -> None:
+        plugin = conn.plugin
+        if plugin is None:
+            return
+        reg = self.app.registry
+        if reg.plugin(plugin.id) is plugin:
+            reg.unregister(plugin.id)
+        conn.plugin = None
+
+    def _caller(self, conn: ServerConn, mcp_name: str):
+        async def call(ctx: ToolContext, **arguments: Any) -> Any:
+            client = conn.client
+            if client is None or conn.status != "connected":
+                return {"error": f"The MCP server '{conn.name}' isn't connected right now ({conn.error or conn.status})."}
+            timeout = float(self.app.config.integrations.mcp_timeout_s)
+            try:
+                result = await client.call_tool(mcp_name, arguments, read_timeout_seconds=timeout)
+            except Exception as exc:
+                msg = _err(exc)
+                if _looks_disconnected(exc):
+                    conn.broken.set()
+                return {"error": f"MCP server '{conn.name}' failed: {msg}"}
+            return _result_to_json(result)
+
+        return call
+
+
+def _err(exc: BaseException) -> str:
+    if isinstance(exc, BaseExceptionGroup) and exc.exceptions:
+        return _err(exc.exceptions[0])
+    return str(exc) or type(exc).__name__
+
+
+def _looks_disconnected(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(w in text for w in ("closed", "broken", "disconnect", "endofstream", "connection"))
+
+
+def _protected_url(url: str) -> bool:
+    """https, or plain http to this computer only (where nothing travels over a network)."""
+    parts = urlsplit(url)
+    if parts.scheme == "https":
+        return True
+    if parts.scheme != "http":
+        return False
+    host = (parts.hostname or "").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback  # an IP literal only: a name like 127.example.com is not
+    except ValueError:
+        return False
+
+
+def _auth_of(spec: dict) -> str:
+    auth = spec.get("auth") or ("headers" if spec.get("header_keys") else "none")
+    return auth if auth in AUTH_MODES else "none"
+
+
+def _has(exc: BaseException, kind: type[BaseException]) -> bool:
+    if isinstance(exc, kind):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_has(e, kind) for e in exc.exceptions)
+    return False
+
+
+def _first(exc: BaseException) -> BaseException:
+    while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
+        exc = exc.exceptions[0]
+    return exc
+
+
+def _sign_in_error(exc: BaseException) -> str:
+    from mcp.client.auth import OAuthFlowError, OAuthRegistrationError, OAuthTokenError
+
+    inner = _first(exc)
+    if isinstance(inner, SignInFailed):
+        return str(inner)
+    if isinstance(inner, OAuthRegistrationError):
+        return ("This server doesn't let apps sign in on their own. If it gives you an access token, add it as a "
+                f"header instead. ({inner})")
+    if isinstance(inner, OAuthTokenError):
+        return f"The server turned down the sign-in. Try again. ({inner})"
+    if isinstance(inner, OAuthFlowError):
+        return f"The sign-in didn't work: {inner}"
+    if isinstance(inner, TimeoutError):
+        return "The sign-in took too long. Try again."
+    return f"The sign-in didn't work: {_err(inner)}"
+
+
+def _log_sign_in_result(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.info("mcp sign-in %s ended: %s", task.get_name(), _err(exc))

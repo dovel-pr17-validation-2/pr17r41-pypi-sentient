@@ -1,0 +1,17 @@
+# Secret scanning for CI. Starts from gitleaks' built-in rules (API keys, tokens, private keys...).
+title = "Sentient gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures, docs examples and generated files"
+paths = [
+  '''(^|/)tests/''',
+  '''(^|/)desktop/scripts/seed-[^/]+\.py$''',
+  '''(^|/)desktop/package-lock\.json$''',
+  '''(^|/)node_modules/''',
+  '''(^|/)\.venv/''',
+  '''(^|/)desktop/(out|dist|build)/''',
+  '''(^|/)firmware/esp32s3-glasses/sdkconfig\.defaults$''',
+]

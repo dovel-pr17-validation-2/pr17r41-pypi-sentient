@@ -1,0 +1,435 @@
+/**
+ * Chat timeline model shared by history and live streaming, so both render identically.
+ *
+ * - `foldTranscript` turns raw transcript rows into timeline items: each run of
+ *   assistant rows (with tool_calls) + their tool rows becomes ONE assistant turn.
+ * - `applyAgentEvent` reduces live events into the same `AssistantTurnView`.
+ */
+import type { ActionPreview, AgentEvent, AnswerSource, ApprovalDecision, ContextMeter, MemorySource, OutcomeCheck, Risk, TranscriptMessage, UsageEvent } from './types'
+import { safeJsonParse } from './utils'
+
+export type ToolStatus = 'running' | 'awaiting_approval' | 'done' | 'error' | 'denied'
+
+/** Live `tool_progress` accumulated per call (§10). Not persisted: history shows the final result only. */
+export interface ToolProgressView {
+  stdout: string
+  stderr: string
+  status?: string
+  frame?: { image: string; url?: string; title?: string }
+  subagent?: { subagentId?: string; messages: string[] }
+}
+
+/** An email, message or post waiting in its undo window (#142), live only. */
+export interface UndoView {
+  undoId: string
+  seconds: number
+  /** ISO time the window ends. */
+  until: string
+  preview?: ActionPreview | null
+  status: 'waiting' | 'sent' | 'undone' | 'failed'
+}
+
+export interface ToolCallView {
+  callId: string
+  name: string
+  arguments: Record<string, unknown>
+  result?: unknown
+  isError?: boolean
+  durationMs?: number | null
+  status: ToolStatus
+  progress?: ToolProgressView
+  undo?: UndoView
+  /** What code found the call really did (#165), live from its `tool_result`. */
+  check?: OutcomeCheck | null
+}
+
+const MAX_STREAM_CHARS = 24_000
+
+export type ApprovalStatus = 'pending' | ApprovalDecision | 'expired'
+
+export interface ApprovalView {
+  approvalId: string
+  callId: string
+  name: string
+  arguments: Record<string, unknown>
+  risk: Risk
+  reason: string
+  status: ApprovalStatus
+  /** Engine label of what is acted on ("Place order"), live only. */
+  target?: string | null
+  riskLabel?: string | null
+  /** Why this asks although rules would let it run: the chat read outside content (ADR 0018), live only. */
+  untrusted?: string | null
+  /** What a second look found off about this call (#143), live only. */
+  warning?: string | null
+  /** The answers offered (#139), live only. */
+  choices?: ApprovalDecision[] | null
+  grantMinutes?: number | null
+  /** What will be sent or changed, the way a person reads it (#142), live only. */
+  preview?: ActionPreview | null
+}
+
+export type TurnSegment =
+  | { kind: 'thinking'; text: string }
+  | { kind: 'text'; text: string }
+  | { kind: 'tool'; callId: string }
+  /** Something the user added while the reply was running (`chat.steer`). */
+  | { kind: 'interjection'; text: string; id: string }
+
+export type TurnStatus = 'streaming' | 'done' | 'error' | 'cancelled'
+
+export interface AssistantTurnView {
+  kind: 'assistant'
+  id: string
+  segments: TurnSegment[]
+  tools: Record<string, ToolCallView>
+  approvals: ApprovalView[]
+  status: TurnStatus
+  error?: { message: string; recoverable: boolean; code?: string | null }
+  /** Plain notes about this reply that aren't errors (#312: the chat's model couldn't answer), live only. */
+  notices?: string[]
+  messageId?: string | null
+  usage?: { model: string; prompt_tokens: number; completion_tokens: number }
+  /** Memories the reply had in mind (from `done` live, from the final assistant row in history). */
+  memorySources?: MemorySource[]
+  /** Pages, emails, files and apps the reply used (#174), from `done` live or the final assistant row. */
+  sources?: AnswerSource[]
+  /** What code found the reply's calls really did (#165), from `done` live or the final assistant row. */
+  checks?: OutcomeCheck[]
+  createdAt: string
+  /** True while the turn lives in the chat store (not yet reloaded from history). */
+  live?: boolean
+}
+
+export interface AttachmentView {
+  name: string
+  size?: number
+  mime?: string
+  /** Object URL for a local image preview. */
+  previewUrl?: string
+  /** From the chat's history: its file may be gone since, so the chip checks (#458). */
+  saved?: boolean
+}
+
+export interface UserMessageView {
+  kind: 'user'
+  id: string
+  text: string
+  attachments: AttachmentView[]
+  createdAt: string
+  pending?: boolean
+  /** §17: queued, then dropped by Stop everything before it was sent. */
+  notSent?: boolean
+}
+
+/** A message someone else wrote in a paired group chat (ADR 0029): outside content, never the user's words. */
+export interface OtherMessageView {
+  kind: 'other'
+  id: string
+  sender: string
+  text: string
+  createdAt: string
+}
+
+/** Something the user did to the chat, shown as a quiet line: trusting it again after checking it (ADR 0029). */
+export interface ChatNoteView {
+  kind: 'note'
+  id: string
+  text: string
+  createdAt: string
+}
+
+export type TimelineItem = UserMessageView | AssistantTurnView | OtherMessageView | ChatNoteView
+
+/** The line a `trusted` event row shows in the chat. */
+export function trustedNote(content: string | null): string {
+  const data = safeJsonParse<{ was?: unknown; via?: unknown }>(content ?? '', {})
+  const was = typeof data.was === 'string' && data.was.trim() ? data.was.trim() : ''
+  const via = typeof data.via === 'string' && data.via !== 'desktop' ? ` with /trust on ${data.via[0].toUpperCase()}${data.via.slice(1)}` : ''
+  return `You trusted this chat again${via}${was ? ` after checking what it read from ${was}` : ''}. Sending from it follows your usual approval settings until new outside content arrives.`
+}
+
+export function emptyTurn(id: string): AssistantTurnView {
+  return { kind: 'assistant', id, segments: [], tools: {}, approvals: [], status: 'streaming', createdAt: new Date().toISOString(), live: true }
+}
+
+function parseToolResult(content: string | null): unknown {
+  if (content === null || content === undefined) return undefined
+  const trimmed = content.trim()
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) return safeJsonParse(trimmed, content)
+  return content
+}
+
+function resultLooksLikeError(result: unknown): boolean {
+  if (typeof result === 'string') return /^(error|tool error|failed)\b/i.test(result.trim())
+  if (result && typeof result === 'object' && !Array.isArray(result)) {
+    const r = result as Record<string, unknown>
+    return typeof r.error === 'string' && r.error.length > 0 && r.ok !== true
+  }
+  return false
+}
+
+const DECLINED_RE = /user declined|declined this action|denied by (the )?user|user denied|not approved/i
+
+/** The user pressed Undo while a send waited in its window (#142), so nothing was sent. */
+export function wasUndone(result: unknown): boolean {
+  if (result && typeof result === 'object' && !Array.isArray(result)) return (result as { undone?: unknown }).undone === true
+  if (typeof result === 'string' && result.trim().startsWith('{')) return wasUndone(safeJsonParse<unknown>(result.trim(), null))
+  return false
+}
+
+/**
+ * The user said no to an approval, so the call did not happen. The engine returns
+ * `{error: "NOT DONE. The user declined...", declined: true}`; older transcripts only have the error text.
+ */
+export function wasDenied(result: unknown): boolean {
+  if (result && typeof result === 'object' && !Array.isArray(result)) {
+    const r = result as { declined?: unknown; error?: unknown }
+    if (r.declined === true) return true
+    return typeof r.error === 'string' && (DECLINED_RE.test(r.error) || /\bdeclined\b/i.test(r.error))
+  }
+  if (typeof result !== 'string') return false
+  const s = result.trim()
+  if (s.startsWith('{')) {
+    try {
+      return wasDenied(JSON.parse(s))
+    } catch {
+      /* plain text */
+    }
+  }
+  return DECLINED_RE.test(s) || (/^(error|not done|tool error)\b/i.test(s) && /\bdeclined\b/i.test(s))
+}
+
+export function foldTranscript(rows: TranscriptMessage[]): TimelineItem[] {
+  const items: TimelineItem[] = []
+  let turn: AssistantTurnView | null = null
+  let prevRole: string | null = null
+
+  for (const row of rows) {
+    const flagged = (row as { interjection?: boolean }).interjection === true
+    // A steer is persisted as a user row in the middle of the agent loop: right after a tool
+    // result and before the assistant continues. Keep it inside the running turn.
+    if (row.role === 'user' && turn && (flagged || prevRole === 'tool')) {
+      turn.segments.push({ kind: 'interjection', text: row.content ?? '', id: row.id })
+      prevRole = row.role
+      continue
+    }
+    prevRole = row.role
+    if (row.role === 'other') {
+      turn = null
+      items.push({ kind: 'other', id: row.id, sender: row.name?.trim() || 'Someone', text: row.content ?? '', createdAt: row.created_at })
+      continue
+    }
+    if (row.role === 'event') {
+      if (row.name === 'trusted') items.push({ kind: 'note', id: row.id, text: trustedNote(row.content), createdAt: row.created_at })
+      continue
+    }
+    if (row.role === 'user') {
+      turn = null
+      items.push({
+        kind: 'user',
+        id: row.id,
+        text: row.content ?? '',
+        attachments: (row.attachments ?? []).map((name) => ({ name, saved: true })),
+        createdAt: row.created_at
+      })
+    } else if (row.role === 'assistant') {
+      if (!turn) {
+        turn = { kind: 'assistant', id: row.id, segments: [], tools: {}, approvals: [], status: 'done', createdAt: row.created_at }
+        items.push(turn)
+      }
+      if (row.thinking?.trim()) turn.segments.push({ kind: 'thinking', text: row.thinking })
+      if (row.content?.trim()) turn.segments.push({ kind: 'text', text: row.content })
+      for (const tc of row.tool_calls ?? []) {
+        turn.segments.push({ kind: 'tool', callId: tc.id })
+        turn.tools[tc.id] = {
+          callId: tc.id,
+          name: tc.function?.name ?? 'tool',
+          arguments: safeJsonParse<Record<string, unknown>>(tc.function?.arguments, {}),
+          status: 'done'
+        }
+      }
+      if (!row.tool_calls?.length) turn.messageId = row.id
+      if (row.memory_sources?.length) turn.memorySources = row.memory_sources
+      if (row.sources?.length) turn.sources = row.sources
+      if (row.checks?.length) turn.checks = row.checks
+    } else if (row.role === 'tool') {
+      const callId = row.tool_call_id ?? ''
+      const target = turn?.tools[callId]
+      const result = parseToolResult(row.content)
+      if (target) {
+        target.result = result
+        target.isError = resultLooksLikeError(result)
+        target.status = wasDenied(result) || wasUndone(result) ? 'denied' : target.isError ? 'error' : 'done'
+      } else if (turn) {
+        // orphan tool row: show it anyway
+        turn.segments.push({ kind: 'tool', callId: callId || row.id })
+        turn.tools[callId || row.id] = { callId: callId || row.id, name: row.name ?? 'tool', arguments: {}, result, status: 'done' }
+      }
+    }
+  }
+  return items
+}
+
+function appendText(segments: TurnSegment[], kind: 'thinking' | 'text', text: string): TurnSegment[] {
+  const last = segments[segments.length - 1]
+  if (last && last.kind === kind) {
+    return [...segments.slice(0, -1), { kind, text: last.text + text }]
+  }
+  return [...segments, { kind, text }]
+}
+
+/** Pure reducer: live agent event -> updated turn. Unknown events return the turn unchanged. */
+export function applyAgentEvent(turn: AssistantTurnView, ev: AgentEvent): AssistantTurnView {
+  switch (ev.type) {
+    case 'thinking_delta':
+      return { ...turn, segments: appendText(turn.segments, 'thinking', ev.text) }
+    case 'text_delta':
+      return { ...turn, segments: appendText(turn.segments, 'text', ev.text) }
+    case 'user_interjection':
+      return { ...turn, segments: [...turn.segments, { kind: 'interjection', text: ev.text, id: `i-${turn.segments.length}-${ev.text.length}` }] }
+    case 'tool_progress': {
+      const prev = turn.tools[ev.call_id] ?? { callId: ev.call_id, name: ev.name, arguments: {}, status: 'running' as const }
+      const p: ToolProgressView = prev.progress ?? { stdout: '', stderr: '' }
+      let next: ToolProgressView = p
+      if (ev.kind === 'stdout' || ev.kind === 'stderr') {
+        const joined = (p[ev.kind] + (ev.text ?? '')).slice(-MAX_STREAM_CHARS)
+        next = { ...p, [ev.kind]: joined }
+      } else if (ev.kind === 'status') {
+        next = { ...p, status: ev.text ?? p.status }
+      } else if (ev.kind === 'frame' && ev.image) {
+        const d = ev.data ?? {}
+        next = { ...p, frame: { image: ev.image, url: typeof d.url === 'string' ? d.url : p.frame?.url, title: typeof d.title === 'string' ? d.title : p.frame?.title } }
+      } else if (ev.kind === 'subagent') {
+        const d = ev.data ?? {}
+        const message = typeof d.message === 'string' ? d.message : ev.text
+        next = {
+          ...p,
+          subagent: {
+            subagentId: typeof d.subagent_id === 'string' ? d.subagent_id : p.subagent?.subagentId,
+            messages: message ? [...(p.subagent?.messages ?? []), message].slice(-40) : (p.subagent?.messages ?? [])
+          }
+        }
+      }
+      const segments = turn.tools[ev.call_id] ? turn.segments : [...turn.segments, { kind: 'tool' as const, callId: ev.call_id }]
+      return { ...turn, segments, tools: { ...turn.tools, [ev.call_id]: { ...prev, progress: next } } }
+    }
+    case 'tool_call': {
+      if (turn.tools[ev.call_id]) return turn
+      return {
+        ...turn,
+        segments: [...turn.segments, { kind: 'tool', callId: ev.call_id }],
+        tools: { ...turn.tools, [ev.call_id]: { callId: ev.call_id, name: ev.name, arguments: ev.arguments ?? {}, status: 'running' } }
+      }
+    }
+    case 'approval_request': {
+      const existing = turn.tools[ev.call_id]
+      const tools = {
+        ...turn.tools,
+        [ev.call_id]: { ...(existing ?? { callId: ev.call_id, name: ev.name, arguments: ev.arguments ?? {} }), status: 'awaiting_approval' as const }
+      }
+      const segments = existing ? turn.segments : [...turn.segments, { kind: 'tool' as const, callId: ev.call_id }]
+      return {
+        ...turn,
+        tools,
+        segments,
+        approvals: [
+          ...turn.approvals.filter((a) => a.approvalId !== ev.approval_id),
+          {
+            approvalId: ev.approval_id,
+            callId: ev.call_id,
+            name: ev.name,
+            arguments: ev.arguments ?? {},
+            risk: ev.risk,
+            reason: ev.reason,
+            target: ev.target ?? null,
+            riskLabel: ev.risk_label ?? null,
+            untrusted: ev.untrusted ?? null,
+            warning: ev.warning ?? null,
+            choices: ev.choices ?? null,
+            grantMinutes: ev.grant_minutes ?? null,
+            preview: ev.preview ?? null,
+            status: 'pending'
+          }
+        ]
+      }
+    }
+    case 'undo_window': {
+      const prev = turn.tools[ev.call_id] ?? { callId: ev.call_id, name: ev.name, arguments: {}, status: 'running' as const }
+      const segments = turn.tools[ev.call_id] ? turn.segments : [...turn.segments, { kind: 'tool' as const, callId: ev.call_id }]
+      const undo: UndoView = { undoId: ev.undo_id, seconds: ev.seconds, until: ev.until, preview: ev.preview ?? null, status: 'waiting' }
+      return { ...turn, segments, tools: { ...turn.tools, [ev.call_id]: { ...prev, status: 'running', undo } } }
+    }
+    case 'tool_result': {
+      const prev = turn.tools[ev.call_id] ?? { callId: ev.call_id, name: ev.name, arguments: {}, status: 'running' as const }
+      const approval = turn.approvals.find((a) => a.callId === ev.call_id)
+      const undone = wasUndone(ev.result)
+      const denied = approval?.status === 'deny' || wasDenied(ev.result) || undone
+      const segments = turn.tools[ev.call_id] ? turn.segments : [...turn.segments, { kind: 'tool' as const, callId: ev.call_id }]
+      return {
+        ...turn,
+        segments,
+        tools: {
+          ...turn.tools,
+          [ev.call_id]: {
+            ...prev,
+            result: ev.result,
+            isError: ev.is_error,
+            check: ev.check ?? null,
+            durationMs: ev.duration_ms,
+            status: denied ? 'denied' : ev.is_error ? 'error' : 'done',
+            undo: prev.undo ? { ...prev.undo, status: undone ? 'undone' : ev.is_error ? 'failed' : 'sent' } : undefined
+          }
+        },
+        approvals: turn.approvals.map((a) => (a.callId === ev.call_id && a.status === 'pending' ? { ...a, status: 'expired' } : a))
+      }
+    }
+    case 'usage': {
+      const u = turn.usage
+      return {
+        ...turn,
+        usage: {
+          model: ev.model,
+          prompt_tokens: (u?.prompt_tokens ?? 0) + (ev.prompt_tokens ?? 0),
+          completion_tokens: (u?.completion_tokens ?? 0) + (ev.completion_tokens ?? 0)
+        }
+      }
+    }
+    case 'notice':
+      return turn.notices?.includes(ev.message) ? turn : { ...turn, notices: [...(turn.notices ?? []), ev.message] }
+    case 'error':
+      return { ...turn, error: { message: ev.message, recoverable: ev.recoverable ?? true, code: ev.code ?? null }, status: turn.status === 'streaming' ? 'error' : turn.status }
+    case 'done': {
+      const memorySources = ev.memory_sources?.length ? ev.memory_sources : turn.memorySources
+      const sources = ev.sources?.length ? ev.sources : turn.sources
+      const checks = ev.checks?.length ? ev.checks : turn.checks
+      if (ev.cancelled) {
+        const error = turn.error?.message === 'Stopped.' ? undefined : turn.error
+        return { ...turn, status: 'cancelled', error, messageId: ev.message_id, memorySources, sources, checks }
+      }
+      const hasText = turn.segments.some((s) => s.kind === 'text' && s.text.trim())
+      const segments = !hasText && ev.content?.trim() ? [...turn.segments, { kind: 'text' as const, text: ev.content }] : turn.segments
+      const tools = Object.fromEntries(
+        Object.entries(turn.tools).map(([k, t]) => [k, t.status === 'running' || t.status === 'awaiting_approval' ? { ...t, status: 'done' as const } : t])
+      )
+      return { ...turn, segments, tools, status: turn.error && !hasText && !ev.content ? 'error' : 'done', messageId: ev.message_id, memorySources, sources, checks }
+    }
+    default:
+      return turn
+  }
+}
+
+/** Plain text of a turn (for copy). */
+/** A `usage` event's context fields as a meter, or null when the model's context length is unknown (#131). */
+export function meterFrom(ev: UsageEvent): ContextMeter | null {
+  if (!ev.context_length) return null
+  return { used: ev.context_used ?? 0, length: ev.context_length, percent: ev.context_percent ?? 0, warning: ev.context_warning ?? null }
+}
+
+export function turnText(turn: AssistantTurnView): string {
+  return turn.segments
+    .filter((s): s is { kind: 'text'; text: string } => s.kind === 'text')
+    .map((s) => s.text)
+    .join('\n\n')
+    .trim()
+}

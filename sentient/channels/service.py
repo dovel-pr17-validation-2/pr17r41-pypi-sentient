@@ -1,0 +1,902 @@
+"""Messaging channels (docs/API.md section 14): Telegram and Discord bots paired with pairing codes, and
+WhatsApp linked to the user's own account (their "Message yourself" chat).
+
+- Tokens live in the OS keychain (``channel_<id>_token``); config and logs never see them. WhatsApp has no
+  token: its linked session is kept under ``~/.sentient/whatsapp``.
+- A paired chat is a normal Sentient chat whose session has ``channel`` = the channel id.
+- Delivery: ``notification.new`` events (task results, plans awaiting approval, questions from running
+  tasks, proactive suggestions, subagent completions) are forwarded to paired chats with ``deliver`` on,
+  with action buttons. A reply to a delivered task question message is the answer to that question. A task's
+  own ``deliver_to`` (``tasks/delivery.py``) can keep its notifications on the desktop or send them only to
+  chosen chats instead.
+- Rules from chat (#130): a "Make this a rule?" proposal made in a paired chat is sent back to that chat with
+  "Make it a rule" / "Not now" (numbered on WhatsApp); answering there decides it, and an answer given in the
+  desktop app settles the message.
+- Approvals outside the app (#139): a task waiting for approval (a tool set to Ask, or sending after outside
+  content) is sent to the paired chats as buttons ("Allow once", "Allow for this task", "Allow for 1 hour",
+  "Always allow", "Deny"; numbered on WhatsApp), or answered by replying with a word. It goes out only while
+  nobody is looking at the app (``app.presence``); one raised while the window is in front waits and goes out when
+  the person leaves. Only a chat it was sent to can answer it (the delivered message is remembered per chat), and a
+  request past its time can't be approved.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hashlib
+import logging
+import re
+from typing import Any
+
+from sentient import secrets as keychain
+from sentient.channels.base import Button, Channel, ChannelError
+from sentient.channels.discord import DiscordChannel
+from sentient.channels.formatting import summary_text
+from sentient.channels.store import ChannelStore
+from sentient.channels.telegram import TelegramChannel
+from sentient.channels.whatsapp import WhatsAppChannel
+from sentient.memory.forget import forget as forget_learned
+from sentient.proactivity.brief import DailyBrief
+from sentient.services import Service
+from sentient.tasks.delivery import WHATSAPP_SELF
+from sentient.tools.rules import RULE_TITLES
+
+log = logging.getLogger(__name__)
+
+_UNSET: Any = object()
+TASK_RESULT_EVENTS = {
+    "run_completed", "run_failed", "planning_failed", "clarification_needed", "disabled",
+    "script_alert", "script_failed", "script_recovered", "handed_off", "source_missing",
+}
+STATUS_LABELS = {
+    "approved": "Approved", "declined": "Declined", "dismissed": "Dismissed", "answered": "Answered", "cancelled": "Cancelled",
+    "expired": "Expired", "allow": "Allowed", "deny": "Denied",
+    "kept": "Keeping them running", "paused": "Paused", "resumed": "Resumed",  # routines while away (#163)
+}
+APPROVAL_HINT = "Tap a button, or reply to this message with {words}."
+APPROVAL_WORDS = {
+    "allow": "once", "allow_task": "task", "allow_timed": "hour", "allow_always": "always", "deny": "no",
+}
+RULE_OUTCOMES = {"accepted": "Made it a rule. Change it in Settings > Approvals & safety.", "declined": "Not now"}
+QUESTION_ROW = 2  # option buttons per row (Discord allows 5 per row and 5 rows)
+# an answer from an older message of the same run, after a newer request took its place (#337)
+OLDER_REQUEST = "This message is for an earlier request, so it can't answer the one waiting now. Use the newest message."
+OLDER_REQUEST_REPLY = (
+    "That message was for an earlier request, so I didn't pass this on. Reply to the newest message to answer the one "
+    "waiting now."
+)
+_TOKEN_LOG_RE = re.compile(r"bot\d{5,}:[A-Za-z0-9_-]{20,}")
+
+
+class _RedactTokens(logging.Filter):
+    """httpx logs request URLs at INFO; Telegram puts the bot token in the URL path."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        redacted = _TOKEN_LOG_RE.sub("bot<token>", message)
+        if redacted != message:
+            record.msg, record.args = redacted, ()
+        return True
+
+
+def install_log_redaction() -> None:
+    for name in ("httpx", "httpcore"):
+        logger = logging.getLogger(name)
+        if not any(isinstance(f, _RedactTokens) for f in logger.filters):
+            logger.addFilter(_RedactTokens())
+
+
+def request_stamp(item: dict) -> str:
+    """What names one request of a run (#337): an approval's ``expires_at``, else the question's ``request_id`` (else
+    ``asked_at``, for one asked before request ids). A notification payload, a ``waiting_questions`` entry and a run's
+    ``pending_question`` all carry them."""
+    return str(item.get("expires_at") or item.get("request_id") or item.get("asked_at") or "")
+
+
+def request_tag(stamp: str) -> str:
+    """A short tag of ``request_stamp`` for button data (Telegram allows 64 bytes; ``ta:4:<run id>:<tag>`` is 46)."""
+    return hashlib.sha1(stamp.encode("utf-8")).hexdigest()[:8] if stamp else ""
+
+
+def _button_ref(run_id: str, payload: dict) -> str:
+    tag = request_tag(request_stamp(payload))
+    return f"{run_id}:{tag}" if tag else str(run_id)
+
+
+class ChannelService(Service):
+    name = "channels"
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.store = ChannelStore(app.store)
+        self.channels: dict[str, Channel] = {
+            "telegram": TelegramChannel(self), "discord": DiscordChannel(self), "whatsapp": WhatsAppChannel(self),
+        }
+        # notification id -> [(channel, chat_id, message_id)] for messages with action buttons
+        self._delivered: dict[str, list[tuple[str, str, str]]] = {}
+        self._approval_notes: dict[str, str] = {}  # approval_id -> the notification that carried it (#443)
+        self._subagents_sent: set[tuple[str, str, str]] = set()
+        self._rule_cards: dict[str, tuple[str, str, str]] = {}  # proposal id -> (channel, chat_id, message_id)
+        # approval requests held back while the person is in the app (#139): notification id -> notification
+        self._held: dict[str, dict] = {}
+        self._listening = asyncio.Event()
+        install_log_redaction()
+
+    # ------------------------------------------------------------------ lifecycle
+    async def start(self) -> None:
+        await self.store.migrate()
+        self._loops.append(asyncio.create_task(self._listen(), name="channels:delivery"))
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._listening.wait(), timeout=2)
+        if not self.app.config.channels.enabled:
+            return
+        for ch in self.channels.values():
+            state = await self.store.state(ch.id)
+            if not state["enabled"]:
+                continue
+            if not ch.uses_token:
+                if not await ch.restore():  # type: ignore[attr-defined]
+                    await self.set_status(ch.id, "error", error=f"{ch.display_name} needs to be linked again. "
+                                          "Click Reconnect and scan the code.")
+                    continue
+            elif token := keychain.get_secret(ch.secret_name):
+                ch.token = token
+            else:
+                await self.set_status(ch.id, "error", error="The bot token is missing from the system keychain. Connect again.")
+                continue
+            if self.app.enable_background and ch.cfg.enabled:
+                await self.set_status(ch.id, "connecting", error=None)
+                ch.start_runtime()
+
+    async def stop(self) -> None:
+        for ch in self.channels.values():
+            with contextlib.suppress(Exception):
+                await ch.stop_runtime()
+        await super().stop()
+
+    async def halt(self) -> int:
+        """Stop everything: stop the reply in progress in every chat and drop queued messages."""
+        stopped = 0
+        for ch in self.channels.values():
+            stopped += await ch.stop_all_turns()
+        return stopped
+
+    # ------------------------------------------------------------------ helpers
+    def get(self, channel_id: str) -> Channel:
+        ch = self.channels.get(channel_id)
+        if ch is None:
+            raise ChannelError(f"Unknown channel '{channel_id}'.", 404)
+        return ch
+
+    async def channel_dict(self, channel_id: str) -> dict:
+        ch = self.get(channel_id)
+        state = await self.store.state(channel_id)
+        return {
+            "id": ch.id,
+            "display_name": ch.display_name,
+            "status": state.get("status") or "disconnected",
+            "account_label": state.get("account_label"),
+            "error": state.get("error"),
+            "qr": ch.qr,
+            "paired": await self.store.chats(channel_id),
+            "setup": {"fields": ch.setup_fields, "instructions_md": ch.instructions_md},
+        }
+
+    async def list(self) -> list[dict]:
+        return [await self.channel_dict(cid) for cid in self.channels]
+
+    async def publish_channel(self, channel_id: str) -> None:
+        self.app.bus.publish("channel.updated", await self.channel_dict(channel_id))
+
+    async def set_status(self, channel_id: str, status: str, *, error: Any = _UNSET, account_label: Any = _UNSET) -> None:
+        state = await self.store.state(channel_id)
+        fields: dict[str, Any] = {}
+        if state.get("status") != status:
+            fields["status"] = status
+        if error is not _UNSET and state.get("error") != error:
+            fields["error"] = error
+        if account_label is not _UNSET and account_label and state.get("account_label") != account_label:
+            fields["account_label"] = account_label
+        if fields:
+            await self.store.set_state(channel_id, **fields)
+            await self.publish_channel(channel_id)
+
+    async def is_connected(self, channel_id: str) -> bool:
+        ch = self.channels.get(channel_id)
+        if ch is None or not ch.ready:
+            return False
+        return bool((await self.store.state(channel_id))["enabled"])
+
+    # ------------------------------------------------------------------ REST operations
+    async def connect(self, channel_id: str, fields: dict[str, Any]) -> dict:
+        ch = self.get(channel_id)
+        if not self.app.config.channels.enabled or not ch.cfg.enabled:
+            raise ChannelError(f"{ch.display_name} is turned off in Settings (Channels).")
+        if not ch.uses_token:
+            return await self._link(ch)
+        token, label = await ch.validate(fields or {})
+        if not keychain.set_secret(ch.secret_name, token):
+            raise ChannelError("Couldn't save the token in the system keychain.", 500)
+        await ch.stop_runtime()
+        previous = await self.store.state(channel_id)
+        same_bot = previous.get("account_label") == label
+        ch.token = token
+        await self.store.set_state(
+            channel_id, enabled=1, status="connected", account_label=label, error=None,
+            cursor=previous.get("cursor") if same_bot else None,
+        )
+        if self.app.enable_background:
+            ch.start_runtime()
+        await self.publish_channel(channel_id)
+        return await self.channel_dict(channel_id)
+
+    async def _link(self, ch: Channel) -> dict:
+        """Start (or restart) a channel that links a session instead of using a token: WhatsApp shows a QR
+        code (``qr`` on the Channel, updated through ``channel.updated``) until the phone scans it."""
+        await ch.begin_link()  # type: ignore[attr-defined]
+        await self.store.set_state(ch.id, enabled=1, status="connecting" if ch.ready else "linking", error=None)
+        if self.app.enable_background:
+            ch.start_runtime()
+        await self.publish_channel(ch.id)
+        return await self.channel_dict(ch.id)
+
+    async def disconnect(self, channel_id: str, *, forget: bool = False) -> dict:
+        """Stop a messaging app. ``forget``: also forget what Sentient learned there (#153): its chats and their
+        messages, summaries and facts; the result then carries ``forgotten``. Paired chats stay paired."""
+        ch = self.get(channel_id)
+        if not ch.uses_token:
+            await ch.unlink()  # type: ignore[attr-defined]
+        await ch.stop_runtime()
+        ch.token = None
+        if ch.uses_token:
+            keychain.delete_secret(ch.secret_name)
+        await self.store.clear_code(channel_id)
+        await self.store.set_state(channel_id, enabled=0, status="disconnected", error=None, account_label=None)
+        forgotten = await forget_learned(self.app, f"channel:{channel_id}", ch.display_name) if forget else None
+        await self.publish_channel(channel_id)
+        out = await self.channel_dict(channel_id)
+        return {**out, "forgotten": forgotten} if forgotten is not None else out
+
+    async def create_pairing(self, channel_id: str) -> dict:
+        ch = self.get(channel_id)
+        if not await self.is_connected(channel_id):
+            raise ChannelError(f"Connect {ch.display_name} before pairing a chat.", 409)
+        minutes = self.app.config.channels.pairing_code_minutes
+        code, expires_at = await self.store.new_code(channel_id, minutes)
+        state = await self.store.state(channel_id)
+        instructions = ch.pairing_instructions(code, state.get("account_label"))  # type: ignore[attr-defined]
+        return {"code": code, "expires_at": expires_at, "instructions": f"{instructions} (valid for {minutes} minutes)"}
+
+    async def set_deliver(self, channel_id: str, chat_id: str, deliver: bool) -> dict:
+        self.get(channel_id)
+        if not await self.store.update_chat(channel_id, chat_id, deliver=bool(deliver)):
+            raise ChannelError("That chat isn't paired.", 404)
+        await self.publish_channel(channel_id)
+        return await self.channel_dict(channel_id)
+
+    async def remove_chat(self, channel_id: str, chat_id: str) -> dict:
+        ch = self.get(channel_id)
+        if await self.store.chat(channel_id, chat_id) is None:
+            raise ChannelError("That chat isn't paired.", 404)
+        await ch.cancel_turn(chat_id)
+        await self.store.remove_chat(channel_id, chat_id)
+        await self.publish_channel(channel_id)
+        return await self.channel_dict(channel_id)
+
+    async def test(self, channel_id: str, chat_id: str | None = None) -> dict:
+        ch = self.get(channel_id)
+        if not await self.is_connected(channel_id):
+            return {"ok": False, "error": f"{ch.display_name} isn't connected."}
+        try:
+            if chat_id:
+                if await self.store.chat(channel_id, str(chat_id)) is None:
+                    return {"ok": False, "error": "That chat isn't paired."}
+                name = self.app.config.assistant.name
+                await ch.send_markdown(str(chat_id), f"This is a test message from **{name}**. Everything is working.")
+            else:
+                await ch.check()  # type: ignore[attr-defined]
+        except ChannelError as exc:
+            return {"ok": False, "error": exc.message}
+        except Exception as exc:
+            return {"ok": False, "error": ch.redact(str(exc))[:300]}
+        return {"ok": True}
+
+    # ------------------------------------------------------------------ delivery
+    async def _listen(self) -> None:
+        async with self.app.bus.subscribe() as queue:
+            self._listening.set()
+            while True:
+                event = await queue.get()
+                try:
+                    kind, data = event.get("type"), event.get("data")
+                    if not isinstance(data, dict):
+                        continue
+                    if kind == "notification.new":
+                        await self.deliver_notification(data)
+                    elif kind == "notification.updated":
+                        self._held.pop(str(data.get("id")), None)
+                        await self.update_delivered(data)
+                    elif kind == "presence.changed" and not data.get("in_app"):
+                        await self.deliver_held()
+                    elif kind == "subagent.updated":
+                        await self.deliver_subagent(data)
+                    elif kind == "rule_proposal.updated":
+                        await self.deliver_rule_proposal(data)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("channel delivery failed")
+
+    async def _delivery_targets(self) -> list[tuple[Channel, dict]]:
+        targets = []
+        for ch in self.channels.values():
+            if not await self.is_connected(ch.id):
+                continue
+            for chat in await self.store.chats(ch.id):
+                if chat["deliver"]:
+                    targets.append((ch, chat))
+        return targets
+
+    async def _chosen_targets(self, chosen: list[dict]) -> list[tuple[Channel, dict]]:
+        """The paired chats a task picked (its ``deliver_to`` list), whatever their own delivery switch says.
+        ``whatsapp`` / ``self`` is the "Message yourself" chat of the linked number."""
+        targets: list[tuple[Channel, dict]] = []
+        for item in chosen:
+            ch = self.channels.get(str(item.get("channel")))
+            if ch is None or not await self.is_connected(ch.id):
+                continue
+            chat_id = str(item.get("chat_id") or "")
+            if ch.id == "whatsapp" and chat_id == WHATSAPP_SELF:
+                chat_id = getattr(ch, "self_chat", None) or ""
+            chat = await self.store.chat(ch.id, chat_id) if chat_id else None
+            if chat is not None and not any(c.id == ch.id and t["chat_id"] == chat["chat_id"] for c, t in targets):
+                targets.append((ch, chat))
+        return targets
+
+    async def _task_delivery(self, note: dict) -> str | list[dict]:
+        """``deliver_to`` of the task a notification belongs to (task results, questions, plans, briefs)."""
+        task_id = (note.get("payload") or {}).get("task_id") or note.get("task_id")
+        fn = getattr(self.app.tasks, "delivery_for", None)
+        if not task_id or fn is None:
+            return "default"
+        try:
+            return await fn(str(task_id))
+        except Exception:  # fail closed: never send to chats the task may have left out
+            log.exception("could not read where task %s delivers", task_id)
+            return "desktop"
+
+    async def _reminder_delivery(self, note: dict) -> str | list[dict]:
+        """The paired chat a timer, reminder or alarm was set in. One set anywhere else stays on the desktop, except
+        that with ``channels.deliver_reminders`` a reminder or alarm also goes to the delivery chats ("default", #359)."""
+        payload = note.get("payload") or {}
+        # one set in a messaging chat that is no longer paired never goes to other chats
+        elsewhere = "default" if (
+            self.app.config.channels.deliver_reminders and payload.get("event") in {"reminder", "alarm"}
+            and payload.get("channel") not in self.channels
+        ) else "desktop"
+        session_id = payload.get("session_id")
+        if not session_id:
+            return elsewhere
+        try:
+            found = await self.store.chat_for_session(str(session_id))
+        except Exception:  # fail closed
+            log.exception("could not find the chat of a reminder")
+            return "desktop"
+        if found is None:
+            return elsewhere
+        channel, chat = found
+        return [{"channel": channel, "chat_id": chat["chat_id"]}]
+
+    async def _task_result(self, task_id: str | None) -> str:
+        getter = getattr(self.app.tasks, "get", None)
+        if not task_id or getter is None:
+            return ""
+        with contextlib.suppress(Exception):
+            task = await getter(task_id)
+            runs = (task or {}).get("runs") or []
+            result = (runs[-1] or {}).get("result") if runs else None
+            if isinstance(result, dict):
+                return str(result.get("summary") or "")
+        return ""
+
+    async def format_notification(self, note: dict, *, chosen: bool = False) -> tuple[str, list[list[Button]] | None] | None:
+        """The message for a notification, or None when it isn't sent. ``chosen``: the task picked its chats, so
+        the ``channels.deliver_*`` switches don't apply."""
+        cfg = self.app.config.channels
+        if chosen:
+            cfg = cfg.model_copy(update={
+                "deliver_plans": True, "deliver_task_results": True, "deliver_briefs": True, "deliver_suggestions": True,
+            })
+        kind = note.get("kind")
+        payload = note.get("payload") or {}
+        title = (note.get("title") or "").strip()
+        message = summary_text(note.get("message") or "")
+        if kind == "task":
+            event, task_id = payload.get("event"), payload.get("task_id") or note.get("task_id")
+            if event == "approval_needed":
+                if not cfg.deliver_plans or not task_id or payload.get("status"):
+                    return None
+                md = f"**{title or 'Plan ready for approval'}**\n{message}"
+                return md, [[Button("Approve plan", f"tp:a:{task_id}", "success"), Button("Decline", f"tp:d:{task_id}", "danger")]]
+            if event == "question":
+                return self._format_question(note) if cfg.deliver_task_results else None
+            if event in {"away_check", "away_paused"}:  # #163: one message, with the answer as a button
+                if not cfg.deliver_task_results or payload.get("status"):
+                    return None
+                md = f"**{title or 'Your routines'}**\n{message}"
+                button = Button("Keep them running", "aw:k:0", "primary") if event == "away_check" else Button(
+                    "Resume routines", "aw:r:0", "success"
+                )
+                return md, [[button]]
+            if event in TASK_RESULT_EVENTS and cfg.deliver_task_results:
+                md = f"**{title or 'Task update'}**\n{message}"
+                if event == "run_completed":
+                    summary = summary_text(await self._task_result(task_id), 900)
+                    if summary:
+                        md += f"\n\n{summary}"
+                return md, None
+            return None
+        if kind == "proactive":
+            nid = note.get("id")
+            if not cfg.deliver_suggestions or not isinstance(payload.get("suggestion"), dict) or not nid:
+                return None
+            if payload.get("status", "pending") != "pending":
+                return None
+            md = f"**{title or 'Suggestion'}**\n{message}"
+            return md, [[Button("Approve", f"sg:a:{nid}", "success"), Button("Dismiss", f"sg:d:{nid}", "secondary")]]
+        if kind == "brief":
+            brief = payload.get("brief")
+            if not cfg.deliver_briefs or not isinstance(brief, dict) or payload.get("status", "active") != "active":
+                return None
+            return f"**{title or 'Your Daily Brief'}**\n{DailyBrief.as_text(brief, links=True)}", None
+        if kind == "reminder":
+            return f"**{title or 'Reminder'}**\n{message}", None
+        if kind == "approval":
+            # a chat turn's approval, raised where no chat surface could show it (an MCP app's turn,
+            # #443, or an API turn, #211): Allow and Deny answer the same approval the app would have shown
+            approval_id = payload.get("approval_id")
+            if not approval_id or payload.get("status"):
+                return None
+            md = f"**{title or 'Approval needed'}**\n{message}"
+            return md, [[
+                Button("Allow", f"na:a:{approval_id}", "success"),
+                Button("Deny", f"na:d:{approval_id}", "danger"),
+            ]]
+        if payload.get("subagent_id") and cfg.deliver_subagents:
+            return f"**{title or 'Background work finished'}**\n{message}", None
+        return None
+
+    @staticmethod
+    def is_approval(note: dict) -> bool:
+        """An approval request (#139, ADR 0018), as opposed to an ordinary question: a task's, or a
+        chat turn's own approval note (kind "approval", #443)."""
+        payload = note.get("payload") or {}
+        if note.get("kind") == "approval":
+            return bool(payload.get("approval_id"))
+        return note.get("kind") == "task" and payload.get("event") == "question" and isinstance(payload.get("approval"), dict)
+
+    @staticmethod
+    def _format_approval(note: dict) -> tuple[str, list[list[Button]] | None] | None:
+        """ "Approval needed" with one button per offered answer (``ta:<option index>:<run id>:<request tag>``)."""
+        payload = note.get("payload") or {}
+        run_id, question = payload.get("run_id"), str(payload.get("question") or note.get("message") or "").strip()
+        options = [str(o) for o in payload.get("options") or [] if str(o).strip()]
+        if not run_id or not question or not options:
+            return None
+        title = (note.get("title") or "").strip().replace(" needs your answer", " needs your OK") or "A task needs your OK"
+        approval = payload.get("approval") or {}
+        choices = [str(c) for c in approval.get("choices") or []]
+        timed = "hour" if int(approval.get("grant_minutes") or 60) % 60 == 0 else "minutes"  # matches the button
+        words = [timed if c == "allow_timed" else APPROVAL_WORDS[c] for c in choices if c in APPROVAL_WORDS]             if len(choices) == len(options) else []
+        said = (", ".join(words[:-1]) + f" or {words[-1]}") if len(words) > 1 else "yes or no"
+        md = f"**Approval needed: {title}**\n{summary_text(question, 900)}\n\n_{APPROVAL_HINT.format(words=said)}_"
+        ref = _button_ref(run_id, payload)
+        buttons = [
+            Button(label[:60], f"ta:{i}:{ref}", "danger" if label in {"Deny", "No, stop the task"} else "primary")
+            for i, label in enumerate(options)
+        ]
+        return md, [buttons[i:i + QUESTION_ROW] for i in range(0, len(buttons), QUESTION_ROW)]
+
+    @staticmethod
+    def _format_question(note: dict) -> tuple[str, list[list[Button]] | None] | None:
+        payload = note.get("payload") or {}
+        run_id, question = payload.get("run_id"), str(payload.get("question") or note.get("message") or "").strip()
+        if not run_id or not question or payload.get("status"):
+            return None
+        if ChannelService.is_approval(note):
+            return ChannelService._format_approval(note)
+        title = (note.get("title") or "").strip() or "A task needs your answer"
+        options = [str(o) for o in payload.get("options") or [] if str(o).strip()]
+        hint = "Tap an option, or reply to this message with your answer." if options else "Reply to this message with your answer."
+        md = f"**{title}**\n{summary_text(question, 900)}\n\n_{hint}_"
+        if not options:
+            return md, None
+        ref = _button_ref(run_id, payload)
+        buttons = [Button(label[:60], f"tq:{i}:{ref}", "primary") for i, label in enumerate(options)]
+        return md, [buttons[i:i + QUESTION_ROW] for i in range(0, len(buttons), QUESTION_ROW)]
+
+    async def deliver_held(self) -> int:
+        """The person left the app: send the approval requests held back while they were in it, if still waiting."""
+        sent = 0
+        for nid, note in list(self._held.items()):
+            self._held.pop(nid, None)
+            payload = note.get("payload") or {}
+            if note.get("kind") == "approval":
+                # a chat turn's own approval (#443) waits on the broker, not on a task run: it is
+                # still deliverable only while the broker still holds it unanswered (the held copy's
+                # payload never gains a status, so the broker is the source of truth)
+                approval_id = str(payload.get("approval_id") or "")
+                broker = getattr(self.app, "approvals", None)
+                if approval_id and broker is not None and broker.is_waiting(approval_id):
+                    sent += await self.deliver_notification(note)
+                continue
+            run_id = str(payload.get("run_id") or "")
+            if run_id and await self._waiting_question(run_id) is not None:
+                sent += await self.deliver_notification(note)
+        return sent
+
+    @staticmethod
+    def sent_title(md: str) -> str:
+        """The first line of a delivered message, without markdown, short: what the timeline calls it (#345)."""
+        first = next((line for line in md.splitlines() if line.strip()), "")
+        return summary_text(first.replace("**", "").replace("__", "").strip(), 120) or "A message"
+
+    @staticmethod
+    def _what(note: dict) -> str:
+        payload = note.get("payload") or {}
+        kind, event = note.get("kind"), payload.get("event")
+        if payload.get("subagent_id"):
+            return "subagent"
+        if kind == "brief":
+            return "brief"
+        if kind == "proactive":
+            return "suggestion"
+        if kind == "reminder":
+            return "reminder"
+        if kind == "task":
+            if event == "question":
+                return "approval" if ChannelService.is_approval(note) else "question"
+            return "plan" if event == "approval_needed" else "task"
+        return "other"
+
+    @staticmethod
+    def _source_ref(note: dict) -> dict | None:
+        """Where the timeline opens a delivery: the task it came from, else the notification."""
+        payload = note.get("payload") or {}
+        task_id = payload.get("task_id") or note.get("task_id")
+        if task_id:
+            return {"type": "task", "id": str(task_id), "run_id": payload.get("run_id"), "notification_id": note.get("id")}
+        if payload.get("session_id"):
+            return {"type": "chat", "id": str(payload["session_id"])}
+        return {"type": "notification", "id": str(note["id"])} if note.get("id") else None
+
+    async def record_delivery(
+        self, ch: Channel, chat: dict, md: str, *, what: str, reason: str, ref: dict | None, error: str | None = None
+    ) -> None:
+        """Keep a line for the Activity timeline (#345) and tell the window. Never breaks a delivery."""
+        try:
+            row = await self.store.add_delivery(
+                ch.id, chat["chat_id"], chat_label=chat.get("label"), title=self.sent_title(md), what=what,
+                reason=reason, delivered=error is None, error=error, ref=ref,
+            )
+        except Exception:
+            log.exception("could not record a delivery")
+            return
+        self.app.bus.publish("channel.delivery", {k: row[k] for k in ("id", "channel", "chat_id", "title", "status", "ref")})
+
+    @staticmethod
+    def _delivery_error(ch: Channel, exc: Exception) -> str:
+        if isinstance(exc, ChannelError):
+            return exc.message[:200]
+        said = str(getattr(exc, "description", "") or exc)  # Telegram's own words, without the error code
+        return f"{ch.display_name} didn't take the message ({ch.redact(said)[:160] or type(exc).__name__})"
+
+    async def deliver_notification(self, note: dict) -> int:
+        if self.is_approval(note) and getattr(self.app, "presence", None) is not None and self.app.presence.in_app():
+            if note.get("id") and not (note.get("payload") or {}).get("status"):
+                self._held[str(note["id"])] = note  # the person is looking at the app: ask there first (#139)
+            return 0
+        if note.get("kind") == "reminder":  # a timer or reminder goes back to the chat it was set in (#150)
+            where = await self._reminder_delivery(note)
+        else:
+            where = await self._task_delivery(note) if note.get("kind") in {"task", "brief"} else "default"
+        if where == "desktop":
+            return 0
+        chosen = isinstance(where, list)
+        formatted = await self.format_notification(note, chosen=chosen)
+        if formatted is None:
+            return 0
+        md, buttons = formatted
+        subagent_id = (note.get("payload") or {}).get("subagent_id")
+        sent = 0
+        targets = await self._chosen_targets(where) if isinstance(where, list) else await self._delivery_targets()
+        what, ref = self._what(note), self._source_ref(note)
+        if note.get("kind") == "reminder":
+            reason = "reminder" if chosen else "reminder_copy"  # its own chat, or a copy for the delivery chats
+        else:
+            reason = "chosen" if chosen else "default"
+        for ch, chat in targets:
+            if subagent_id:
+                key = (str(subagent_id), ch.id, chat["chat_id"])
+                if key in self._subagents_sent:
+                    continue
+                self._subagents_sent.add(key)
+            try:
+                ids = await ch.send_markdown(chat["chat_id"], md, buttons)
+            except Exception as exc:
+                log.warning("delivering to %s failed: %s", ch.id, ch.redact(str(exc)))
+                await self.record_delivery(ch, chat, md, what=what, reason=reason, ref=ref,
+                                           error=self._delivery_error(ch, exc))
+                continue
+            sent += 1
+            ch.publish_message(chat["chat_id"], None, "out", md)
+            payload = note.get("payload") or {}
+            if note.get("kind") == "task" and payload.get("event") == "question" and ids:
+                try:  # persisted, so a reply still answers the question after a restart
+                    await self.store.add_question(
+                        ch.id, chat["chat_id"], [str(i) for i in ids],
+                        task_id=str(payload.get("task_id") or note.get("task_id") or ""), run_id=str(payload.get("run_id")),
+                        request=request_stamp(payload),
+                    )
+                except Exception:
+                    log.exception("could not remember the delivered question")
+            if buttons and ids and note.get("id"):
+                self._delivered.setdefault(str(note["id"]), []).append((ch.id, chat["chat_id"], ids[-1]))
+                if note.get("kind") == "approval" and payload.get("approval_id"):
+                    # which note carried this approval, so its buttons can be checked against the
+                    # delivery before they answer it (#443, the same ownership rule as #139/#337)
+                    self._approval_notes[str(payload["approval_id"])] = str(note["id"])
+            await self.record_delivery(ch, chat, md, what=what, reason=reason, ref=ref)
+        return sent
+
+    async def update_delivered(self, note: dict) -> None:
+        status = (note.get("payload") or {}).get("status")
+        if status not in STATUS_LABELS:
+            return
+        targets = self._delivered.pop(str(note.get("id")), [])
+        label = STATUS_LABELS[status]
+        payload = note.get("payload") or {}
+        if note.get("kind") == "task" and payload.get("event") == "question":
+            answer = summary_text(str(payload.get("answer") or ""), 80)
+            label = f"Answered: {answer}" if status == "answered" and answer else label
+        elif note.get("kind") == "task" and str(payload.get("event") or "").startswith("away_"):
+            pass  # the label as it is
+        elif note.get("kind") == "task":
+            label = f"Plan {status}"
+        for channel_id, chat_id, message_id in targets:
+            ch = self.channels.get(channel_id)
+            if ch is not None and (chat_id, message_id) in ch._button_text:
+                await ch.settle_buttons(chat_id, message_id, label)
+
+    async def deliver_subagent(self, data: dict) -> bool:
+        if not data.get("background") or data.get("status") not in {"completed", "error"}:
+            return False
+        if not self.app.config.channels.deliver_subagents:
+            return False
+        session_id, subagent_id = data.get("session_id"), data.get("subagent_id")
+        if not session_id or not subagent_id:
+            return False
+        found = await self.store.chat_for_session(str(session_id))
+        if found is None:
+            return False
+        channel_id, chat = found
+        ch = self.channels.get(channel_id)
+        key = (str(subagent_id), channel_id, chat["chat_id"])
+        if ch is None or key in self._subagents_sent or not await self.is_connected(channel_id):
+            return False
+        self._subagents_sent.add(key)
+        goal = summary_text(str(data.get("goal") or ""), 200)
+        if data.get("status") == "completed":
+            md = f"**Background work finished**\n{goal}\n\n{summary_text(str(data.get('summary') or ''), 1500)}".strip()
+        else:
+            md = f"**Background work failed**\n{goal}\n\n{summary_text(str(data.get('error') or ''), 500)}".strip()
+        ref = {"type": "chat", "id": str(session_id)}
+        try:
+            await ch.send_markdown(chat["chat_id"], md)
+        except Exception as exc:
+            log.warning("subagent delivery failed: %s", ch.redact(str(exc)))
+            await self.record_delivery(ch, chat, md, what="subagent", reason="chat", ref=ref,
+                                       error=self._delivery_error(ch, exc))
+            return False
+        await self.record_delivery(ch, chat, md, what="subagent", reason="chat", ref=ref)
+        ch.publish_message(chat["chat_id"], session_id, "out", md)
+        return True
+
+    async def deliver_rule_proposal(self, proposal: dict) -> bool:
+        """Send a new "Make this a rule?" proposal to the paired chat it came from; settle the message once it is
+        answered anywhere (#130). Returns True when a message was sent or settled."""
+        pid, status = str(proposal.get("id") or ""), proposal.get("status")
+        if not pid:
+            return False
+        if status != "pending":
+            sent = self._rule_cards.pop(pid, None)
+            ch = self.channels.get(sent[0]) if sent else None
+            if sent is None or ch is None or (sent[1], sent[2]) not in ch._button_text:
+                return False
+            await ch.settle_buttons(sent[1], sent[2], RULE_OUTCOMES.get(str(status), "Answered"))
+            return True
+        found = await self.store.chat_for_session(str(proposal.get("session_id") or ""))
+        if found is None or pid in self._rule_cards:
+            return False
+        channel_id, chat = found
+        ch = self.channels.get(channel_id)
+        if ch is None or not await self.is_connected(channel_id):
+            return False
+        level = RULE_TITLES.get(str(proposal.get("rule")), "Always ask")
+        what = ", ".join(str(t.get("label") or t.get("key")) for t in proposal.get("targets") or [])
+        said = summary_text(str(proposal.get("said") or ""), 200)
+        md = (
+            f"**Make this a rule?**\n{level}: {what}\n\nYou said \"{said}\". A rule keeps working in every chat. "
+            "Until you choose, I'll check with you before using it here."
+        )
+        buttons = [[Button("Make it a rule", f"rp:a:{pid}", "success"), Button("Not now", f"rp:d:{pid}", "secondary")]]
+        try:
+            ids = await ch.send_markdown(chat["chat_id"], md, buttons)
+        except Exception as exc:
+            log.warning("rule proposal delivery failed: %s", ch.redact(str(exc)))
+            return False
+        if ids:
+            self._rule_cards[pid] = (channel_id, chat["chat_id"], ids[-1])
+        ch.publish_message(chat["chat_id"], str(proposal.get("session_id")), "out", md)
+        return True
+
+    async def act_on_rule_proposal(self, ch: Channel, chat_id: str, message_id: str, proposal_id: str, *, accept: bool) -> str:
+        """The user's answer to a "Make this a rule?" message: the same decision as the desktop card."""
+        self._rule_cards.pop(proposal_id, None)
+        try:
+            proposal = await self.app.chat_rules.decide(proposal_id, "accept" if accept else "decline")
+        except LookupError:
+            outcome = "This is no longer waiting"
+        except ValueError:
+            outcome = "This was already answered"
+        else:
+            outcome = RULE_OUTCOMES[proposal["status"]]
+        await ch.settle_buttons(chat_id, message_id, outcome)
+        return outcome
+
+    # ------------------------------------------------------------------ button actions
+    async def act_on_plan(self, ch: Channel, chat_id: str, message_id: str, task_id: str, *, approve: bool) -> str:
+        fn = getattr(self.app.tasks, "approve" if approve else "decline", None)
+        if fn is None:
+            return "Tasks aren't available right now."
+        self._forget_delivered(ch.id, chat_id, message_id)
+        try:
+            await fn(task_id)
+        except Exception as exc:
+            text = str(exc) or "That didn't work."
+            await ch.settle_buttons(chat_id, message_id, text[:120])
+            return text[:190]
+        outcome = "Plan approved" if approve else "Plan declined"
+        await ch.settle_buttons(chat_id, message_id, outcome)
+        return outcome
+
+    async def act_on_notification_approval(self, ch: Channel, chat_id: str, message_id: str, approval_id: str, *, allow: bool) -> str:
+        """The answer to a chat turn's approval note (kind "approval", #443): it resolves the same
+        broker approval the desktop card answers, so the waiting turn carries on at once."""
+        resolve = getattr(self.app.approvals, "resolve", None)
+        if resolve is None:
+            return "Approvals aren't available right now."
+        # the buttons answer only where this approval was actually delivered, like every other
+        # button in this service (#139, #337): a callback from anywhere else settles nothing
+        note_id = self._approval_notes.get(approval_id)
+        if (ch.id, chat_id, message_id) not in self._delivered.get(note_id or "", []):
+            await ch.settle_buttons(chat_id, message_id, "This request is no longer waiting")
+            return "This request is no longer waiting."
+        self._approval_notes.pop(approval_id, None)
+        self._forget_delivered(ch.id, chat_id, message_id)
+        if not resolve(approval_id, "allow" if allow else "deny", via=ch.id):
+            await ch.settle_buttons(chat_id, message_id, "This request is no longer waiting")
+            return "This request is no longer waiting."
+        outcome = "Allowed" if allow else "Denied"
+        await ch.settle_buttons(chat_id, message_id, outcome)
+        return outcome
+
+    async def act_on_suggestion(self, ch: Channel, chat_id: str, message_id: str, notification_id: str, *, approve: bool) -> str:
+        fn = getattr(self.app.proactivity, "act_on_suggestion", None)
+        if fn is None:
+            return "Suggestions aren't available right now."
+        self._forget_delivered(ch.id, chat_id, message_id)
+        try:
+            result = await fn(notification_id, "approve" if approve else "dismiss")
+        except Exception as exc:
+            text = str(getattr(exc, "detail", "") or exc) or "That didn't work."
+            await ch.settle_buttons(chat_id, message_id, text[:1].upper() + text[1:120])
+            return text[:190]
+        if approve:
+            outcome = "Approved. I've started a task for it." if (result or {}).get("task_id") else "Approved"
+        else:
+            outcome = "Dismissed"
+        await ch.settle_buttons(chat_id, message_id, outcome)
+        return outcome
+
+    async def act_on_question(
+        self, ch: Channel, chat_id: str, message_id: str, ref: str, index: str, *, approval: bool = False
+    ) -> str:
+        """An option button under a task's question (``ref`` = ``<run id>:<request tag>``): answer it with that option.
+        An approval request (``approval``, #139) is only answered from the message that delivered it to this chat.
+        A button of an earlier request of the same run never answers a newer one (#337)."""
+        run_id, _, tag = ref.partition(":")
+        sent = await self.store.question_for(ch.id, chat_id, message_id)
+        if approval and (sent is None or sent["run_id"] != run_id):
+            return "This request wasn't sent to this chat, so it can't be answered here."
+        found = await self._waiting_question(run_id)
+        if found is None:
+            await ch.settle_buttons(chat_id, message_id, "This question is no longer waiting")
+            return "This question is no longer waiting."
+        if found.get("kind") == "approval" and not approval:  # an approval only answers through its own buttons
+            return "Unknown button."
+        stamp = request_stamp(found)
+        sent_for = sent.get("request") if sent is not None and sent["run_id"] == run_id else None
+        if (tag and tag != request_tag(stamp)) or (sent_for and sent_for != stamp):
+            await ch.settle_buttons(chat_id, message_id, "No longer waiting")
+            return OLDER_REQUEST
+        options = found.get("options") or []
+        if not index.isdigit() or int(index) >= len(options):
+            return "Unknown button."
+        self._forget_delivered(ch.id, chat_id, message_id)
+        answer = str(options[int(index)])
+        try:  # ``expect``: if a newer request took its place meanwhile, the engine refuses instead of answering it
+            await self.app.tasks.answer_question(
+                found["task_id"], run_id, answer, via=ch.id, expect=stamp or None
+            )
+        except Exception as exc:
+            text = str(exc) or "That didn't work."
+            await ch.settle_buttons(chat_id, message_id, text[:120])
+            return text[:190]
+        outcome = f"Answered: {summary_text(answer, 80)}"
+        await ch.settle_buttons(chat_id, message_id, outcome)
+        return outcome
+
+    async def _waiting_question(self, run_id: str) -> dict | None:
+        fn = getattr(self.app.tasks, "waiting_questions", None)
+        if fn is None:
+            return None
+        with contextlib.suppress(Exception):
+            for q in await fn():
+                if q.get("run_id") == run_id:
+                    return q
+        return None
+
+    async def answer_reply(self, ch: Channel, chat: dict, reply_to: str, text: str) -> bool:
+        """A message that replies to a delivered task question is the answer to that question.
+
+        Returns True when ``reply_to`` is one of this chat's question messages (answered now, or already
+        handled); False for a reply to anything else, which is then normal chat.
+        """
+        chat_id = str(chat["chat_id"])
+        found = await self.store.question_for(ch.id, chat_id, str(reply_to))
+        if found is None:
+            return False
+        ch.publish_message(chat_id, chat.get("session_id"), "in", text)
+        waiting = await self._waiting_question(found["run_id"])
+        if waiting is None:
+            reply = "That question has already been handled, so I didn't pass this on."
+        elif found.get("request") and found["request"] != request_stamp(waiting):  # a newer request of the run (#337)
+            reply = OLDER_REQUEST_REPLY
+        else:
+            options = [str(o) for o in waiting.get("options") or []]
+            choice = text.strip()
+            if re.fullmatch(r"[0-9]{1,3}", choice) and 1 <= int(choice) <= len(options):
+                text = options[int(choice) - 1]  # "2" picks the second option (ASCII digits only)
+            try:
+                await self.app.tasks.answer_question(
+                    waiting["task_id"], waiting["run_id"], text, via=ch.id, expect=request_stamp(waiting) or None
+                )
+                reply = f"Thanks! I passed your answer to '{summary_text(waiting['task_name'], 80)}'. It's carrying on now."
+            except Exception as exc:
+                reply = f"I couldn't pass that on: {str(exc)[:200] or 'something went wrong'}"
+        await ch.reply(chat_id, reply)
+        ch.publish_message(chat_id, None, "out", reply)
+        return True
+
+    def _forget_delivered(self, channel_id: str, chat_id: str, message_id: str) -> None:
+        for nid, targets in list(self._delivered.items()):
+            kept = [t for t in targets if t != (channel_id, chat_id, message_id)]
+            if kept:
+                self._delivered[nid] = kept
+            else:
+                self._delivered.pop(nid, None)

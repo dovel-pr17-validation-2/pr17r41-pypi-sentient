@@ -1,0 +1,302 @@
+"""Human-in-the-loop gate for risky tool calls.
+
+The agent loop emits an ``ApprovalRequest`` event and then awaits the broker.
+Whichever client is attached (CLI prompt, web UI dialog, a phone notification,
+the glasses) resolves it with ``allow``, ``allow_session`` or ``deny``.
+
+Decisions use the call's *effective* risk (``Tool.risk_fn``). "Allow for this chat"
+covers the tool up to the risk level that was approved: allowing ordinary browser
+clicks never covers a call whose ``risk_fn`` raised it to ``send`` or ``exec`` ("Place order" asks every time).
+A tool declared with ``allow_for_chat=False`` (commands on the host) is never covered by it.
+
+Lasting rules (``tools.approvals.rules``, ADR 0016) are checked first, in code, never by a model. A key is a tool
+name or a plugin id, and a tool's own rule beats its plugin's rule:
+
+- ``never``: the tool is not offered to the model, and a call is refused without running.
+- ``ask``: always ask, even in mode "off", after "Allow for this chat" and for read-only tools.
+- ``allow``: run without asking, except purchases, which still ask whenever approvals are on.
+- ``if_asked`` ("Only if I asked", #140): ``allow`` for a call the user's own words in this chat turn asked for
+  (``decide(..., asked=True)``, worked out by the agent loop with ``rule_levels.asked_for``), else ``ask``.
+- ``hand_off`` ("Hand it to me", #140): the agent loop hands a call that would change something to the user instead
+  of running it; anywhere else it is treated as ``ask``, so it never runs unasked.
+
+A connection set to Read only (``integrations.read_only``, #141) works like a "never" rule on its tools that can
+change, send, delete or run something (``is_hidden``, ``read_only_refusal``): checked per call on the effective risk,
+so a tool whose risk depends on its arguments (Composio's multi-execute) runs look-ups and refuses the rest.
+
+Work nobody asked for (``ToolContext.origin`` in ``UNPROMPTED_ORIGINS``, ADR 0017) is checked before all of this:
+it may only read and make Sentient-internal changes, whatever the mode or rules say (``unprompted_refusal``).
+
+Once a run has read outside content (``ToolContext.untrusted``, ADR 0018), the agent loop asks for every call that
+can send data out (``rules.sends_out``) after "never" rules and before this broker's modes and rules, so an Allow
+rule, mode "off" or "Allow for this chat" never skip that question.
+
+A second look (#143, ``sentient.agent.second_look``, ADR 0024) checks every call that can send data out against what
+the user asked (recipients, amounts, links, and a fast-model check for sends and code). A flagged call asks in the
+agent loop whatever this broker's modes, rules, "Allow for this chat" or grants say.
+
+Scoped grants (#139, ``sentient.agent.grants``): an answer can be wider than one call ("Allow for this task", "Allow
+for 1 hour", "Always allow"). ``create`` records the answers a request offers and ``resolve`` refuses any other, so a
+client can't widen a purchase or a call after outside content. ``granted`` says whether a live grant covers a call;
+the agent loop asks it after modes and rules decided to ask.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import logging
+from collections.abc import Callable, Collection
+from dataclasses import dataclass, field
+from typing import Any
+
+from sentient.agent import grants as grant_rules
+from sentient.config.schema import ApprovalsConfig
+from sentient.tools.base import Risk, Tool, ToolContext, effective_risk
+from sentient.tools.rules import (
+    always_asks,
+    applied_rule,
+    read_only_blocks,
+    read_only_hides,
+    read_only_message,
+    rule_for,
+    rule_label,
+    unprompted_allows,
+    unprompted_message,
+)
+
+log = logging.getLogger(__name__)
+
+Decision = str  # "allow" | "allow_session" | "allow_task" | "allow_timed" | "allow_always" | "deny" (grants.DECISIONS)
+
+
+def _sync_effective_risk(tool: Tool, arguments: dict, ctx: Any) -> Risk:
+    try:
+        value: Any = tool.risk_fn(arguments or {}, ctx)  # type: ignore[misc]
+    except Exception:
+        return Risk.exec
+    if inspect.isawaitable(value):
+        close = getattr(value, "close", None)
+        if callable(close):
+            close()
+        return max(tool.risk, Risk.send)
+    if value is None:
+        return tool.risk
+    if isinstance(value, str):
+        return Risk[value] if value in Risk.__members__ else Risk.exec
+    try:
+        return Risk(value)
+    except (TypeError, ValueError):
+        return Risk.exec
+
+
+@dataclass
+class ApprovalBroker:
+    config: ApprovalsConfig
+    timeout_s: float = 600.0
+    _pending: dict[str, asyncio.Future] = field(default_factory=dict)
+    # (session_id, tool name) -> highest risk the user allowed for this chat
+    _session_allow: dict[tuple[str, str], Risk] = field(default_factory=dict)
+    # the app ids of connections set to Read only (``integrations.read_only``), read on every check so a switch
+    # applies at once (#141)
+    read_only_source: Callable[[], Collection[str] | None] | None = None
+    # task and timed grants, and "Always allow" (#139); None in bare tests
+    grants: grant_rules.GrantStore | None = None
+    # approval id -> the answers that request offered; an answer outside them is refused
+    _choices: dict[str, list[str]] = field(default_factory=dict)
+    # approval id -> where it was answered ("desktop", "telegram"...), for the grant's note
+    _via: dict[str, str] = field(default_factory=dict)
+
+    # ------------------------------------------------------------------ lasting rules
+    def rule(self, tool: Tool) -> str | None:
+        """The lasting rule for ``tool`` (``rules.RULE_CHOICES``) or None (see ``sentient.tools.rules``)."""
+        return rule_for(getattr(self.config, "rules", None), tool)
+
+    def is_never(self, tool: Tool) -> bool:
+        """True when a lasting rule says Sentient must never use ``tool`` (the registry hides it)."""
+        return self.rule(tool) == "never"
+
+    def read_only(self) -> Collection[str]:
+        """App ids of the connections set to Read only."""
+        return (self.read_only_source() if self.read_only_source is not None else None) or ()
+
+    def is_hidden(self, tool: Tool) -> bool:
+        """True when the model must not be offered ``tool``: a "never" rule, or a tool of a Read only connection
+        that can never be a look-up (the registry hides it)."""
+        return self.is_never(tool) or read_only_hides(self.read_only(), tool)
+
+    def read_only_refusal(self, tool: Tool, risk: Risk, registry: Any = None) -> str | None:
+        """The plain refusal when ``tool``'s connection is Read only and this call (effective risk ``risk``) would
+        change, send, delete or run something; None when it may run. Like a "never" rule: checked before every
+        mode, rule and "Allow for this chat", and again right before the tool runs."""
+        if read_only_blocks(self.read_only(), tool, risk):
+            return read_only_message(tool, registry)
+        return None
+
+    def label(self, tool: Tool, registry: Any = None) -> str:
+        return rule_label(tool, getattr(self.config, "rules", None), registry)
+
+    def unprompted_refusal(self, tool: Tool, risk: Risk, registry: Any = None) -> str | None:
+        """For work nobody asked for: None when the call may run (a look-up or a Sentient-internal change), else
+        the plain refusal. Checked before modes and rules, so an Allow rule never lifts it (ADR 0017)."""
+        if unprompted_allows(tool, risk):
+            return None
+        return unprompted_message(self.label(tool, registry))
+
+    def quick_runs(self, tool: Tool, session_id: str | None, arguments: dict, *, asked: bool = False) -> bool:
+        """True when a quick command's call (``sentient.agent.fastpath``) may run at once, with no model and no question.
+        That is a call that would run without asking anyway. ``asked``: the user's message named exactly this change
+        (turn off the living room lights, #175), so in mode "ask" those words are the yes for a change (effective risk
+        ``write``), as with an "Only if I asked" rule. Never for anything above a change, in mode "always", with an
+        Ask, Hand it to me or Never rule, or for a Read only connection."""
+        risk = _sync_effective_risk(tool, arguments, None) if tool.risk_fn is not None else tool.risk
+        if not self.needs_approval(tool, session_id, risk, asked=asked):
+            return True
+        if not asked or risk > Risk.write or self.config.mode != "ask":
+            return False
+        if self.rule(tool) is not None:
+            return False  # an Ask, Hand it to me or Never rule (Allow and Only if I asked never get here)
+        return not read_only_blocks(self.read_only(), tool, risk)
+
+    async def requires_approval(
+        self, tool: Tool, arguments: dict, ctx: ToolContext, session_id: str | None = None
+    ) -> tuple[bool, Risk]:
+        """Evaluate ``tool.risk_fn`` (sync or async) and decide. Returns ``(needs_approval, effective_risk)``."""
+        risk = await effective_risk(tool, arguments, ctx)
+        sid = session_id if session_id is not None else getattr(ctx, "session_id", None)
+        return await self.decide(tool, sid, risk, arguments, ctx), risk
+
+    async def decide(
+        self, tool: Tool, session_id: str | None, risk: Risk, arguments: dict, ctx: Any, *, asked: bool = False
+    ) -> bool:
+        """``needs_approval`` for a call whose effective risk is known. It also checks whether the call is
+        a purchase: purchases always ask, whatever the mode, rules or "allow for this chat" say. ``asked``: the
+        user's own words in this chat turn asked for this call (an "Only if I asked" rule then allows it)."""
+        # a purchase or a call that opens the home (ADR 0028) asks whatever the mode and rules say
+        purchase = await always_asks(tool, arguments, ctx, risk)
+        return self.needs_approval(tool, session_id, risk, purchase=purchase, asked=asked)
+
+    def needs_approval(
+        self,
+        tool: Tool,
+        session_id: str | None,
+        risk: Risk | None = None,
+        *,
+        arguments: dict | None = None,
+        ctx: ToolContext | None = None,
+        purchase: bool = False,
+        asked: bool = False,
+    ) -> bool:
+        """``risk`` is the call's effective risk. Without it, pass ``arguments`` (and ``ctx``) so a synchronous
+        ``tool.risk_fn`` is evaluated here; an async ``risk_fn`` cannot be awaited in this sync method and is
+        treated as at least ``send`` (use ``await requires_approval(...)`` instead). ``purchase`` marks a call
+        that spends money (``decide`` works it out); it always asks, even with approvals mode "off". ``asked``: the user's
+        own words in this chat turn asked for this call, so an "Only if I asked" rule allows it; without it that rule
+        asks, and so does "Hand it to me" (the agent loop hands those calls over before asking this)."""
+        if risk is None and arguments is not None and getattr(tool, "risk_fn", None) is not None:
+            risk = _sync_effective_risk(tool, arguments, ctx)
+        risk = tool.risk if risk is None else Risk(risk)
+        mode = self.config.mode
+        rule = applied_rule(self.rule(tool), asked=asked, risk=risk)
+        if rule in {"ask", "never"}:  # "never" is refused before this; asking is the safe answer anyway
+            return True
+        if read_only_blocks(self.read_only(), tool, risk):  # refused before this too (Read only connection)
+            return True
+        if purchase:  # spending money always asks; browser.confirm_purchases is the only switch for it
+            return True
+        if rule == "allow":
+            return False
+        if mode == "off":
+            return False
+        # a tool with ``allow_for_chat=False`` (the terminal, ADR 0019) asks for every call
+        if self.config.remember_session and session_id and getattr(tool, "allow_for_chat", True):
+            allowed = self._session_allow.get((session_id, tool.name))
+            # a call the tool's risk_fn raised to send/exec (a click on "Place order") always asks again
+            escalated = risk >= Risk.send and risk > tool.risk
+            if allowed is not None and allowed >= risk and not escalated:
+                return False
+        if mode == "always":
+            return True
+        # "ask": confirm things that leave Sentient or cannot be undone; the assistant's own
+        # memory, skills (reviewed separately), files folder and task list do not interrupt.
+        return risk >= Risk.write and not (tool.internal and risk < Risk.send)
+
+    async def granted(self, tool: Tool, risk: Risk, arguments: dict, ctx: Any) -> bool:
+        """True when a live task or timed grant covers this call (#139). Never for a call a grant may not cover:
+        a purchase, a tool that asks every time, a raised risk or running code (``grants.grantable``)."""
+        if self.grants is None:
+            return False
+        if not grant_rules.grantable(tool, risk):
+            return False
+        task_id = (getattr(ctx, "extra", None) or {}).get("task_id")
+        if self.grants.covers(tool.name, risk, str(task_id) if task_id else None) is None:
+            return False
+        return not await always_asks(tool, arguments, ctx, risk)
+
+    def create(self, approval_id: str, choices: list[str] | None = None) -> asyncio.Future:
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending[approval_id] = fut
+        if choices:
+            self._choices[approval_id] = list(choices)
+        return fut
+
+    def cancel(self, approval_id: str) -> None:
+        """Forget an abandoned request without applying an answer or creating any grant."""
+        fut = self._pending.pop(approval_id, None)
+        self._choices.pop(approval_id, None)
+        self._via.pop(approval_id, None)
+        if fut is not None and not fut.done():
+            fut.cancel()
+
+    async def wait(
+        self, approval_id: str, session_id: str | None, tool_name: str, risk: Risk | None = None
+    ) -> Decision:
+        fut = self._pending.get(approval_id) or self.create(approval_id)
+        try:
+            decision: Decision = await asyncio.wait_for(fut, timeout=self.timeout_s)
+        except TimeoutError:
+            decision = "deny"
+        finally:
+            self._pending.pop(approval_id, None)
+            self._choices.pop(approval_id, None)
+            via = self._via.pop(approval_id, "desktop")
+        level = Risk.exec if risk is None else Risk(risk)
+        if decision == "allow_session" and session_id:
+            key = (session_id, tool_name)
+            self._session_allow[key] = max(level, self._session_allow.get(key, Risk.read))
+        elif decision in {grant_rules.ALLOW_TIMED, grant_rules.ALLOW_ALWAYS} and self.grants is not None:
+            try:
+                if decision == grant_rules.ALLOW_TIMED:
+                    await self.grants.add(tool_name, "timed", level, via=via)
+                else:
+                    await self.grants.allow_always(tool_name, via=via)
+            except Exception:  # the call itself was allowed; a grant that failed to save just asks again later
+                log.exception("could not save the approval grant for %s", tool_name)
+        return decision
+
+    def resolve(self, approval_id: str, decision: Decision, via: str = "desktop") -> bool:
+        """Answer a pending request. False when it is no longer waiting or the answer is unknown. A yes wider than
+        the request offers (a client asking "for this chat" on a purchase) counts as "Allow once", so no client can
+        widen a request; that was also what such an answer did before scoped answers (#139)."""
+        fut = self._pending.get(approval_id)
+        if fut is None or fut.done():
+            return False
+        if decision not in grant_rules.DECISIONS:
+            return False
+        offered = self._choices.get(approval_id) or [grant_rules.ALLOW, grant_rules.ALLOW_SESSION, grant_rules.DENY]
+        if decision not in offered:
+            decision = grant_rules.ALLOW
+        self._via[approval_id] = via or "desktop"
+        fut.set_result(decision)
+        return True
+
+    def pending_ids(self) -> list[str]:
+        return list(self._pending)
+
+    def is_waiting(self, approval_id: str) -> bool:
+        """True while an answer would still reach a waiter: created and not yet answered. (An answered
+        request leaves ``_pending`` only when its waiter's cleanup runs, so membership alone is not
+        proof an answer is still wanted.)"""
+        fut = self._pending.get(approval_id)
+        return fut is not None and not fut.done()

@@ -1,0 +1,175 @@
+import {
+  IconArchive,
+  IconBolt,
+  IconBrain,
+  IconChartBar,
+  IconCode,
+  IconCpu,
+  IconFolders,
+  IconListCheck,
+  IconMicrophone,
+  IconMoodSmile,
+  IconSettings,
+  IconShieldCheck,
+  IconSparkles,
+  IconTerminal2,
+  IconTool,
+  IconUserHeart,
+  IconUsersGroup,
+  IconWorldWww,
+  type Icon
+} from '@tabler/icons-react'
+
+export interface SettingsSectionMeta {
+  id: string
+  label: string
+  description: string
+  icon: Icon
+  /** Extra words matched by the settings search and the command palette. */
+  keywords: string[]
+  /** Config sections rendered by the schema-driven form (if any). */
+  schemaSections?: string[]
+}
+
+export const SETTINGS_SECTIONS: SettingsSectionMeta[] = [
+  {
+    id: 'general',
+    label: 'General',
+    description: 'Names, timezone, language, appearance, startup and shortcuts.',
+    icon: IconSettings,
+    keywords: ['name', 'timezone', 'location', 'language', 'theme', 'dark', 'light', 'accent', 'color', 'login', 'startup', 'tray', 'shortcut', 'hotkey', 'keyboard', 'screen', 'share', 'screenshot', 'window', 'region', 'incognito', 'private']
+  },
+  {
+    id: 'models',
+    label: 'Models',
+    description: 'Which model does which job, API keys and local models.',
+    icon: IconCpu,
+    keywords: ['llm', 'ollama', 'openai', 'anthropic', 'api key', 'provider', 'embedding', 'fallback', 'reasoning', 'temperature', 'pull']
+  },
+  {
+    id: 'personality',
+    label: 'Personality',
+    description: "Sentient's soul and what it knows about you.",
+    icon: IconMoodSmile,
+    keywords: ['soul', 'persona', 'user.md', 'tone', 'voice', 'about me']
+  },
+  {
+    id: 'memory',
+    label: 'Memory',
+    description: 'How Sentient learns and recalls facts about you.',
+    icon: IconBrain,
+    keywords: ['facts', 'recall', 'similarity', 'summaries', 'workspace', 'review'],
+    schemaSections: ['memory']
+  },
+  {
+    id: 'folders',
+    label: 'Folders',
+    description: 'Folders of notes and Obsidian vaults Sentient searches when you ask about your notes.',
+    icon: IconFolders,
+    keywords: ['obsidian', 'vault', 'notes', 'documents', 'markdown', 'pdf', 'word', 'search', 'knowledge', 'index', 'ignore', 'files'],
+    schemaSections: ['folders']
+  },
+  {
+    id: 'knowing',
+    label: 'Knowing you',
+    description: 'How Sentient builds its picture of you and tidies its memory overnight.',
+    icon: IconUserHeart,
+    keywords: ['user model', 'insights', 'about you', 'dreams', 'dreaming', 'consolidation', 'overnight', 'questions'],
+    schemaSections: ['user_model', 'dreaming']
+  },
+  {
+    id: 'tasks',
+    label: 'Tasks',
+    description: 'Long-running work, scheduling, plan approval and tasks by email.',
+    icon: IconListCheck,
+    keywords: ['scheduler', 'runs', 'swarm', 'plan', 'timeout', 'away', 'pause', 'routines', 'vacation', 'email', 'forward', 'tasks by email', 'sentient address'],
+    schemaSections: ['tasks']
+  },
+  {
+    id: 'proactivity',
+    label: 'Proactivity',
+    description: 'Suggestions from your connected apps.',
+    icon: IconBolt,
+    keywords: ['suggestions', 'quiet hours', 'poll', 'confidence', 'heartbeat', 'unanswered emails', 'follow-ups', 'nudge'],
+    schemaSections: ['proactivity']
+  },
+  {
+    id: 'voice',
+    label: 'Voice',
+    description: 'Speech recognition and the voice Sentient speaks with.',
+    icon: IconMicrophone,
+    keywords: ['speech', 'stt', 'tts', 'whisper', 'dictation', 'dictate', 'push to talk', 'shortcut', 'hotkey', 'wake word', 'hey sentient', 'always listening', 'follow-up']
+  },
+  {
+    id: 'approvals',
+    label: 'Approvals & safety',
+    description: 'When Sentient asks before acting.',
+    icon: IconShieldCheck,
+    keywords: ['permissions', 'confirm', 'risk', 'tools', 'disabled', 'ask', 'allow', 'never', 'only if i asked', 'hand it to me', 'draft', 'rules', 'apps', 'always ask', 'allowed for now', 'revoke', 'grant'],
+    schemaSections: ['tools']
+  },
+  {
+    id: 'sandbox',
+    label: 'Code execution',
+    description: 'Small scripts Sentient writes and runs to get things done.',
+    icon: IconCode,
+    keywords: ['sandbox', 'python', 'docker', 'scripts', 'execute', 'code', 'watchers'],
+    schemaSections: ['sandbox']
+  },
+  {
+    id: 'terminal',
+    label: 'Terminal',
+    description: 'Commands Sentient can run on this computer, with your OK.',
+    icon: IconTerminal2,
+    keywords: ['terminal', 'shell', 'command', 'commands', 'powershell', 'bash', 'git', 'folders', 'allowed commands', 'blocked'],
+    schemaSections: ['terminal']
+  },
+  {
+    id: 'browser',
+    label: 'Browser',
+    description: 'The web browser Sentient uses for sites without an integration.',
+    icon: IconWorldWww,
+    keywords: ['browser', 'chrome', 'edge', 'websites', 'shopping', 'purchases', 'live view', 'profiles', 'sign in', 'brave', 'attach'],
+    schemaSections: ['browser']
+  },
+  {
+    id: 'subagents',
+    label: 'Helpers',
+    description: 'Helpers Sentient can hand parts of a bigger job to.',
+    icon: IconUsersGroup,
+    keywords: ['subagents', 'delegate', 'parallel', 'background', 'workers', 'helpers'],
+    schemaSections: ['subagents']
+  },
+  {
+    id: 'evolution',
+    label: 'Self-evolution',
+    description: 'Skills Sentient writes for itself and how it keeps them tidy.',
+    icon: IconSparkles,
+    keywords: ['skills', 'curator', 'review', 'profile'],
+    schemaSections: ['evolution', 'skills']
+  },
+  {
+    id: 'usage',
+    label: 'Usage',
+    description: 'What your models cost, a monthly budget, and tokens by model and day.',
+    icon: IconChartBar,
+    keywords: ['tokens', 'cost', 'insights', 'statistics', 'budget', 'spend', 'money', 'dollars', 'price', 'bill']
+  },
+  {
+    id: 'backups',
+    label: 'Backups',
+    description: 'Back up and restore your data, and snapshots taken before updates.',
+    icon: IconArchive,
+    keywords: ['backup', 'back up', 'restore', 'snapshot', 'export', 'copy', 'undo', 'schedule', 'new computer', 'move'],
+    schemaSections: ['backups']
+  },
+  {
+    id: 'advanced',
+    label: 'Advanced',
+    description: 'Data folder, logs, engine and raw configuration.',
+    icon: IconTool,
+    keywords: ['logs', 'folder', 'restart', 'version', 'json', 'debug', 'gateway', 'integrations', 'hermes', 'import', 'migrate', 'move']
+  }
+]
+
+export const sectionById = (id: string | undefined) => SETTINGS_SECTIONS.find((s) => s.id === id)
